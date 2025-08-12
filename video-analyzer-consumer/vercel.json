@@ -1,0 +1,7 @@
+{
+  "version": 2,
+  "env": {
+    "WORKER_URL": "https://jolly-dream-33e8.1170731839.workers.dev/"
+  }
+}
+

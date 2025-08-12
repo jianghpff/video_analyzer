@@ -1,0 +1,27 @@
+{
+  "name": "video-bitable-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-08-01",
+  "vars": {
+    "FEISHU_APP_TOKEN": "T68zbfXIlaHT0TsOuvNc8iEZnib",
+    "FEISHU_TABLE_ID": "tblQXAFdK6F1YlBf",
+    "VERCEL_CONSUMER_URL": "https://video-analyzer-consumer-4b735l52l-jianghpffs-projects.vercel.app/api/queue-consumer",
+    "RATE_LIMIT_QPS": "5",
+    "VERCEL_PROTECTION_BYPASS": ""
+  },
+  "queues": {
+    "producers": [
+      { "binding": "VIDEO_ANALYSIS_QUEUE", "queue": "video-analysis-queues" }
+    ],
+    "consumers": [
+      { "queue": "video-analysis-queues" }
+    ]
+  },
+  "services": [
+    {
+      "binding": "TOKEN_PROXY_SERVICE",
+      "service": "feishu-token-proxy",
+      "environment": "production"
+    }
+  ]
+}
