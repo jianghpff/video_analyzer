@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import fetch from 'node-fetch';
 
 const WORKER_URL = process.env.WORKER_URL || 'https://jolly-dream-33e8.1170731839.workers.dev/';
@@ -20,6 +20,42 @@ async function fetchVideoBufferById(videoId) {
   return Buffer.from(await mp4.arrayBuffer());
 }
 
+const ANALYSIS_RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    "script": {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          "startTime": { type: Type.STRING },
+          "endTime": { type: Type.STRING },
+          "transcription": { type: Type.STRING },
+          "screen_description": { type: Type.STRING },
+          "summary": { type: Type.STRING }
+        },
+        required: ["startTime", "endTime", "transcription", "screen_description", "summary"]
+      }
+    },
+    "score": {
+      type: Type.OBJECT,
+      properties: {
+        "opening_appeal": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
+        "product_highlights": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
+        "use_case_scenarios": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
+        "call_to_action": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
+        "fluency_and_emotion": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] }
+      },
+      required: ["opening_appeal", "product_highlights", "use_case_scenarios", "call_to_action", "fluency_and_emotion"]
+    },
+    "tags": {
+      type: Type.ARRAY,
+      items: { type: Type.STRING }
+    }
+  },
+  required: ["script", "score", "tags"]
+};
+
 const VALID_TAGS_TEXT = `
 一、视频特征类: 真人出镜+口播, 配音, 无配音, 搭配BGM, 节奏紧凑, 节奏缓慢, 视频情绪高, 视频情绪中等, 视频情绪低
 二、内容套路类: 沉浸式护肤, 妆前妆后, 好物测评, 保姆级教程, 成分深扒, VLOG种草, 挑战跟风
@@ -37,15 +73,31 @@ async function translateScript(genAI, script) {
   const result = await genAI.models.generateContent({
     model: "gemini-2.5-pro",
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: { responseMimeType: "application/json" },
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.NUMBER },
+            startTime: { type: Type.STRING },
+            endTime: { type: Type.STRING },
+            transcription: { type: Type.STRING },
+            screen_description: { type: Type.STRING },
+            summary: { type: Type.STRING },
+          },
+          required: ["id", "startTime", "endTime", "transcription", "screen_description", "summary"],
+        }
+      }
+    },
   });
 
-  const rawText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const rawText = result.response.text();
   if (!rawText) throw new Error("translateScript: Gemini returned empty content.");
-  const jsonMatch = rawText.match(/\[[\s\S]*\]/); // Look for an array
-  const textToParse = jsonMatch ? jsonMatch[0] : rawText;
+
   try {
-    return JSON.parse(textToParse);
+    return JSON.parse(rawText);
   } catch (e) {
     throw new Error(`translateScript: Failed to parse JSON. Response started with: "${rawText.slice(0, 100)}..."`);
   }
@@ -56,14 +108,24 @@ async function validateAndCorrectTags(genAI, generatedTags) {
     return [];
   }
 
-  const validTags = generatedTags.filter(tag => VALID_TAGS.has(tag));
-  const invalidTags = generatedTags.filter(tag => !VALID_TAGS.has(tag));
+  const validTags = VALID_TAGS_TEXT.split('\n').flatMap(line => line.split(': ')[1]?.split(', ') || []).map(tag => tag.trim());
+  const validTagsSet = new Set(validTags);
+  
+  const invalidTags = generatedTags.filter(tag => !validTagsSet.has(tag));
+  const alreadyValidTags = generatedTags.filter(tag => validTagsSet.has(tag));
 
   if (invalidTags.length > 0) {
     console.warn(`Found invalid tags: ${invalidTags.join(', ')}. Attempting to correct...`);
     const correctionPrompt = `
-      你是一位专业的标签校准专家。请将以下标签列表中的错误标签纠正为正确的标签。
-      请严格保持原有的标签列表结构和顺序不变，仅返回纠正后的标签列表。
+      你是一位专业的标签校准专家。请参考以下“标签体系”，将“待纠正标签”列表中的每一个标签，映射到体系中最接近的一个正确标签上。
+
+      - 你的输出必须是一个JSON数组，数组中的每个元素都是一个字符串，即纠正后的标签。
+      - 数组的长度必须与输入的“待纠正标签”列表完全一致。
+      - 严格按照原始顺序进行映射。
+      - 禁止自创任何标签，所有返回的标签都必须严格存在于“标签体系”中。
+
+      标签体系:
+      ${VALID_TAGS_TEXT}
 
       待纠正标签:
       ${JSON.stringify(invalidTags)}
@@ -74,16 +136,25 @@ async function validateAndCorrectTags(genAI, generatedTags) {
       contents: [{ role: 'user', parts: [{ text: correctionPrompt }] }],
       generationConfig: {
         responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING }
+        }
       },
     });
 
     try {
-      const text = correctionResult.candidates[0].content.parts[0].text.replace(/^```json\s*/, '').replace(/```\s*$/i, '').trim();
-      const correctedArray = JSON.parse(text);
-      return correctedArray;
+      const rawText = correctionResult.response.text();
+      if (!rawText) return generatedTags; // 如果没有返回，则不进行修正
+      
+      const correctedArray = JSON.parse(rawText);
+      if (Array.isArray(correctedArray)) {
+        return [...alreadyValidTags, ...correctedArray];
+      }
+      return generatedTags;
     } catch (e) {
       console.error("Failed to parse corrected tags from Gemini, returning original.", e);
-      return generatedTags; // 如果校准失败，返回原始标签
+      return generatedTags;
     }
   }
   return generatedTags;
@@ -91,31 +162,9 @@ async function validateAndCorrectTags(genAI, generatedTags) {
 
 async function analyzeSingleVideo(genAI, buffer) {
   const prompt = `
-    你的角色是一个只返回JSON的API。你的全部响应必须是一个单一、有效的JSON对象。禁止在JSON对象之前或之后输出任何文本、Markdown标记或解释。
-
     作为一名顶级的电商视频分析专家，你的任务是分析所提供的视频，并评估其销售转化潜力。
 
     请以JSON格式提供你的分析报告。JSON对象内的所有字符串值都必须是中文，但"transcription"字段除外，它应为原文。
-    JSON结构应严格遵循以下格式：
-    {
-      "script": [
-        {
-          "startTime": "HH:MM:SS",
-          "endTime": "HH:MM:SS",
-          "transcription": "如果视频片段中包含语音或画外音，请将其一字不差地转录为原文。如果没有，则此处应为空字符串。",
-          "screen_description": "【强制要求】用客观的语言详细描述这个时间片段内画面上发生了什么。例如：'一位女士在展示一款白色瓶子的产品'。此项不得为空。",
-          "summary": "用中文精炼地总结这个片段的核心目的或想要传达的关键信息。"
-        }
-      ],
-      "score": {
-        "opening_appeal": { "score": 0, "reasoning": "" },
-        "product_highlights": { "score": 0, "reasoning": "" },
-        "use_case_scenarios": { "score": 0, "reasoning": "" },
-        "call_to_action": { "score": 0, "reasoning": "" },
-        "fluency_and_emotion": { "score": 0, "reasoning": "" }
-      },
-      "tags": ["<从下方标签库中选择的最贴切的中文标签>"]
-    }
 
     脚本生成指南：
     - 【强制要求】必须根据视频内容的逻辑和节奏，将其合理地切分成多个连续的时间片段。
@@ -131,16 +180,10 @@ async function analyzeSingleVideo(genAI, buffer) {
     - 【强制要求】输出的必须是只包含中文标签字符串的JSON数组。
 
     --- 标签体系 ---
-    一、视频特征类: 真人出镜+口播, 配音, 无配音, 搭配BGM, 节奏紧凑, 节奏缓慢, 视频情绪高, 视频情绪中等, 视频情绪低
-    二、内容套路类: 沉浸式护肤, 妆前妆后, 好物测评, 保姆级教程, 成分深扒, VLOG种草, 挑战跟风
-    三、情绪钩子类: 戳中痛点, 解压治愈, 惊天反差, 懒人必备, 空瓶记, 平替/大牌同款
-    四、口播节奏类: OMG式安利, 快语速带货, 聊天式分享, ASMR耳语
-    五、本土化与文化契合度: 泰式幽默/玩梗, 泰国节日/热点, 泰语口语化表达, 符合泰国审美, 明星/网红同款
-    六、TikTok平台特性: 使用热门BGM/音效, 利用热门滤镜/特效, 卡点/转场运镜, 引导评论区互动, 挂小黄车/引流链接
-    七、视频商业化成熟度: 强效用展示, 价格优势/促销, 信任状/背书, 制造稀缺/紧迫感, 开箱/沉浸式体验
+${VALID_TAGS_TEXT}
     --------------------
 
-    最后提醒：分析视频，并以中文提供JSON输出（"transcription"除外）。你的全部响应必须是一个单一的JSON对象，不得包含任何其他内容。
+    最后提醒：分析视频，并以中文提供JSON输出（"transcription"除外）。
   `;
 
   const videoPart = { inlineData: { data: buffer.toString("base64"), mimeType: "video/mp4" } };
@@ -156,17 +199,18 @@ async function analyzeSingleVideo(genAI, buffer) {
   const result = await genAI.models.generateContent({
     model: "gemini-2.5-pro",
     contents: contents,
-    generationConfig: { responseMimeType: "application/json" },
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: ANALYSIS_RESPONSE_SCHEMA,
+    },
     safetySettings,
   });
   
-  const rawText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const rawText = result.response.text();
   if (!rawText) throw new Error("analyzeSingleVideo: Gemini returned empty content.");
-  const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-  const textToParse = jsonMatch ? jsonMatch[0] : rawText;
 
   try {
-    const analysis = JSON.parse(textToParse);
+    const analysis = JSON.parse(rawText);
     const scores = analysis.score;
     const finalScore = (scores.opening_appeal.score * 0.2) +
                        (scores.product_highlights.score * 0.3) +
@@ -182,7 +226,7 @@ async function analyzeSingleVideo(genAI, buffer) {
       tags: analysis.tags,
     };
   } catch (e) {
-    throw new Error(`analyzeSingleVideo: Failed to parse JSON. Response started with: "${rawText.slice(0, 100)}..."`);
+    throw new Error(`analyzeSingleVideo: Failed to parse or process analysis. Raw response: "${rawText.slice(0, 100)}...". Error: ${e.message}`);
   }
 }
 
