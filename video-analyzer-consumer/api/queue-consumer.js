@@ -1,5 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import fetch from 'node-fetch';
+import FormData from 'form-data';
 
 const WORKER_URL = process.env.WORKER_URL || 'https://jolly-dream-33e8.1170731839.workers.dev/';
 
@@ -20,213 +21,211 @@ async function fetchVideoBufferById(videoId) {
   return Buffer.from(await mp4.arrayBuffer());
 }
 
-const ANALYSIS_RESPONSE_SCHEMA = {
+async function uploadVideoToFeishu(buffer, filename, accessToken, appToken) {
+  const uploadUrl = 'https://open.feishu.cn/open-apis/drive/v1/medias/upload_all';
+  const form = new FormData();
+  form.append('file_name', filename);
+  form.append('parent_type', 'bitable_file');
+  form.append('parent_node', appToken);
+  form.append('size', String(buffer.length));
+  form.append('file', buffer, { filename, contentType: 'video/mp4' });
+
+  const resp = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...form.getHeaders(),
+    },
+    body: form,
+  });
+
+  const text = await resp.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) {
+    throw new Error(`Feishu medias upload non-JSON response: ${resp.status} ${resp.statusText} ${text?.slice(0,200)}`);
+  }
+  if (!resp.ok || data.code !== 0) {
+    throw new Error(`Feishu medias upload failed: ${resp.status} ${data.msg || text?.slice(0,200)}`);
+  }
+  return data.data?.file_token || data.data?.file?.file_token;
+}
+
+// Removed legacy AI schema/functions for old "视频脚本/视频标签/视频得分" pipeline
+
+const NEW_ANALYSIS_RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
-    "script": {
+    detected_language_code: { type: Type.STRING },
+    subtitle_groups: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
-          "startTime": { type: Type.STRING },
-          "endTime": { type: Type.STRING },
-          "transcription": { type: Type.STRING },
-          "screen_description": { type: Type.STRING },
-          "summary": { type: Type.STRING }
+          startTime: { type: Type.STRING },
+          endTime: { type: Type.STRING },
+          text: { type: Type.STRING },
+          translation: { type: Type.STRING },
+          summary: { type: Type.STRING },
+          purpose: { type: Type.STRING },
+          isVisuallyStrong: { type: Type.BOOLEAN },
+          visualStrengthReason: { type: Type.STRING, nullable: true },
+          highlightSummary: { type: Type.STRING, nullable: true },
         },
-        required: ["startTime", "endTime", "transcription", "screen_description", "summary"]
-      }
+        required: [
+          'startTime',
+          'endTime',
+          'text',
+          'translation',
+          'summary',
+          'purpose',
+          'isVisuallyStrong',
+        ],
+      },
     },
-    "score": {
+    overall_score: { type: Type.INTEGER },
+    score_rationale: { type: Type.STRING },
+    video_structure: {
       type: Type.OBJECT,
       properties: {
-        "opening_appeal": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
-        "product_highlights": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
-        "use_case_scenarios": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
-        "call_to_action": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] },
-        "fluency_and_emotion": { type: Type.OBJECT, properties: { "score": { type: Type.NUMBER }, "reasoning": { type: Type.STRING } }, required: ["score", "reasoning"] }
-      },
-      required: ["opening_appeal", "product_highlights", "use_case_scenarios", "call_to_action", "fluency_and_emotion"]
-    },
-    "tags": {
-      type: Type.ARRAY,
-      items: { type: Type.STRING }
-    }
-  },
-  required: ["script", "score", "tags"]
-};
-
-const VALID_TAGS_TEXT = `
-一、视频特征类: 真人出镜+口播, 配音, 无配音, 搭配BGM, 节奏紧凑, 节奏缓慢, 视频情绪高, 视频情绪中等, 视频情绪低
-二、内容套路类: 沉浸式护肤, 妆前妆后, 好物测评, 保姆级教程, 成分深扒, VLOG种草, 挑战跟风
-三、情绪钩子类: 戳中痛点, 解压治愈, 惊天反差, 懒人必备, 空瓶记, 平替/大牌同款
-四、口播节奏类: OMG式安利, 快语速带货, 聊天式分享, ASMR耳语
-五、本土化与文化契合度: 泰式幽默/玩梗, 泰国节日/热点, 泰语口语化表达, 符合泰国审美, 明星/网红同款
-六、TikTok平台特性: 使用热门BGM/音效, 利用热门滤镜/特效, 卡点/转场运镜, 引导评论区互动, 挂小黄车/引流链接
-七、视频商业化成熟度: 强效用展示, 价格优势/促销, 信任状/背书, 制造稀缺/紧迫感, 开箱/沉浸式体验
-`;
-
-async function translateScript(genAI, script) {
-  if (!Array.isArray(script) || script.length === 0) return [];
-  const toTranslate = script.map((s, id) => ({ id, ...s }));
-  const prompt = `你是一位专业的翻译家。请将以下JSON数组中每个对象的 "transcription", "screen_description", "summary" 字段都翻译成流畅、准确的中文。严格保持JSON结构和 "id" 不变。待翻译内容: ${JSON.stringify(toTranslate)}`;
-  const result = await genAI.models.generateContent({
-    model: "gemini-2.5-pro",
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: {
+        golden_3s_hook_analysis: { type: Type.STRING },
+        segments: {
         type: Type.ARRAY,
         items: {
           type: Type.OBJECT,
           properties: {
-            id: { type: Type.NUMBER },
-            startTime: { type: Type.STRING },
-            endTime: { type: Type.STRING },
-            transcription: { type: Type.STRING },
-            screen_description: { type: Type.STRING },
-            summary: { type: Type.STRING },
+              timeRange: { type: Type.STRING },
+              partName: { type: Type.STRING },
+              description: { type: Type.STRING },
+            },
+            required: ['timeRange', 'partName', 'description'],
           },
-          required: ["id", "startTime", "endTime", "transcription", "screen_description", "summary"],
-        }
-      }
-    },
-  });
-
-  const rawText = result.response.text();
-  if (!rawText) throw new Error("translateScript: Gemini returned empty content.");
-
-  try {
-    return JSON.parse(rawText);
-  } catch (e) {
-    throw new Error(`translateScript: Failed to parse JSON. Response started with: "${rawText.slice(0, 100)}..."`);
-  }
-}
-
-async function validateAndCorrectTags(genAI, generatedTags) {
-  if (!Array.isArray(generatedTags)) {
-    return [];
-  }
-
-  const validTags = VALID_TAGS_TEXT.split('\n').flatMap(line => line.split(': ')[1]?.split(', ') || []).map(tag => tag.trim());
-  const validTagsSet = new Set(validTags);
-  
-  const invalidTags = generatedTags.filter(tag => !validTagsSet.has(tag));
-  const alreadyValidTags = generatedTags.filter(tag => validTagsSet.has(tag));
-
-  if (invalidTags.length > 0) {
-    console.warn(`Found invalid tags: ${invalidTags.join(', ')}. Attempting to correct...`);
-    const correctionPrompt = `
-      你是一位专业的标签校准专家。请参考以下“标签体系”，将“待纠正标签”列表中的每一个标签，映射到体系中最接近的一个正确标签上。
-
-      - 你的输出必须是一个JSON数组，数组中的每个元素都是一个字符串，即纠正后的标签。
-      - 数组的长度必须与输入的“待纠正标签”列表完全一致。
-      - 严格按照原始顺序进行映射。
-      - 禁止自创任何标签，所有返回的标签都必须严格存在于“标签体系”中。
-
-      标签体系:
-      ${VALID_TAGS_TEXT}
-
-      待纠正标签:
-      ${JSON.stringify(invalidTags)}
-    `;
-
-    const correctionResult = await genAI.models.generateContent({
-      model: "gemini-2.5-pro",
-      contents: [{ role: 'user', parts: [{ text: correctionPrompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING }
-        }
+        },
       },
-    });
+      required: ['golden_3s_hook_analysis', 'segments'],
+    },
+    script_analysis: {
+      type: Type.OBJECT,
+      properties: {
+        marketing_stage_summary: { type: Type.STRING },
+        negativeSummary: { type: Type.STRING },
+        strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+        weaknesses: { type: Type.ARRAY, items: { type: Type.STRING } },
+        suggestions: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+      required: ['marketing_stage_summary', 'negativeSummary', 'strengths', 'weaknesses', 'suggestions'],
+    },
+    video_tags: {
+      type: Type.OBJECT,
+      properties: {
+        videoType: { type: Type.STRING },
+        emotionalTone: { type: Type.STRING },
+        coreContentAngle: { type: Type.STRING },
+        otherTags: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+      required: ['videoType', 'emotionalTone', 'coreContentAngle', 'otherTags'],
+    },
+  },
+  required: ['detected_language_code', 'subtitle_groups', 'script_analysis'],
+};
 
-    try {
-      const rawText = correctionResult.response.text();
-      if (!rawText) return generatedTags; // 如果没有返回，则不进行修正
-      
-      const correctedArray = JSON.parse(rawText);
-      if (Array.isArray(correctedArray)) {
-        return [...alreadyValidTags, ...correctedArray];
-      }
-      return generatedTags;
-    } catch (e) {
-      console.error("Failed to parse corrected tags from Gemini, returning original.", e);
-      return generatedTags;
-    }
-  }
-  return generatedTags;
-}
+async function analyzeVideoWithSchema(genAI, buffer, feishuRecordId) {
+  const systemInstruction = `You are an expert short-form video script analyst for TikTok, specializing in the skincare niche. Your task is to analyze a video and provide a structured, critical evaluation.
 
-async function analyzeSingleVideo(genAI, buffer) {
-  const prompt = `
-    作为一名顶级的电商视频分析专家，你的任务是分析所提供的视频，并评估其销售转化潜力。
+**Analysis Rules & Output Schema:**
 
-    请以JSON格式提供你的分析报告。JSON对象内的所有字符串值都必须是中文，但"transcription"字段除外，它应为原文。
+1.  **Language:**
+    * **Detect Language:** You MUST identify the primary spoken language of the video and return its BCP-47 code (e.g., "en-US", "th-TH", "zh-CN") in the \`detected_language_code\` field.
+    * **Keep Original Language:** Extract all subtitles in their original spoken language.
+    * **Translation:** Provide a concise **Simplified Chinese** translation for each subtitle line. THIS IS A MANDATORY REQUIREMENT.
+    * **Analysis Language:** All analysis (summaries, purposes, critiques, etc.) must be in Simplified Chinese.
 
-    脚本生成指南：
-    - 【强制要求】必须根据视频内容的逻辑和节奏，将其合理地切分成多个连续的时间片段。
-    - 【强制要求】对于每一个片段，都必须同时提供“transcription”（原文）、“screen_description”（画面描述）和“summary”（中文总结）。
-    - 【强制要求】“screen_description”字段绝对不能留空，必须有详细的画面描述。
+2.  **Scoring (0-100):**
+    * **Context:** The score must reflect the video's potential for success **specifically within the TikTok skincare short-video context.**
+    * **Negative Bias:** Be critical. Overly generic content, poor structure, or a weak hook should be heavily penalized. A score of 50-60 is average. A score above 85 requires exceptional quality.
+    * **Score Rationale:** Briefly justify the score in one sentence, referencing the video's structure and hook.
 
-    评分指南：
-    - 对每个维度的评分范围为0到100。
+3.  **Video Structure Analysis:**
+    * **Golden 3s Hook Analysis:** Critically evaluate the first 3 seconds. Focus **only on weaknesses**. Is the hook clear? Is it attention-grabbing? What could be improved? If it's good, briefly state why, but still find a point of improvement.
+    * **Content Segmentation:** Break the video into logical parts (e.g., Hook, Problem Intro, Product Showcase, CTA). For each part, provide the \`timeRange\` (e.g., "00:00 - 00:05"), \`partName\` (e.g., "钩子 / Hook"), and a brief \`description\`.
 
-    标签生成指南：
-    - 【强制要求】你必须从下方的“标签体系”中，挑选出3-7个最符合视频特征的中文标签。
-    - 【强制要求】你的选择必须严格来自于“标签体系”，禁止自创任何标签。
-    - 【强制要求】输出的必须是只包含中文标签字符串的JSON数组。
+4.  **Subtitle Segmentation:**
+    * **Semantic Grouping:** Do NOT split subtitles mid-sentence. Group them into semantically complete thoughts or sentences. Each group should have a \`startTime\` and \`endTime\`.
+    * **Per-Segment Analysis:** For each subtitle group:
+        * \`summary\`: A brief summary of the line's content.
+        * \`purpose\`: The marketing purpose of the line (e.g., "建立信任", "制造紧迫感").
+        * \`isVisuallyStrong\`: \`true\` ONLY if the visual composition for this specific segment is exceptionally good (e.g., great lighting, creative transition, strong emotional acting). Be very selective. Most segments should be \`false\`.
+        * \`visualStrengthReason\`: **(MANDATORY if \`isVisuallyStrong\` is true)** A short tag explaining WHY it's strong (e.g., "构图出色", "情感表达强烈"). Cannot be null if \`isVisuallyStrong\` is true.
+        * \`highlightSummary\`: **(MANDATORY if \`isVisuallyStrong\` is true)** A brief summary of what is happening in this high-quality clip. Cannot be null if \`isVisuallyStrong\` is true.
 
-    --- 标签体系 ---
-${VALID_TAGS_TEXT}
-    --------------------
+5.  **Overall Script Evaluation:**
+    * \`marketing_stage_summary\`: Identify the primary marketing stage this script is suited for (Awareness, Interest, or Conversion) and briefly explain why.
+    * \`negativeSummary\`: A single, critical sentence that summarizes the video's biggest weakness.
+    * \`strengths\`: List 2-3 key strengths.
+    * \`weaknesses\`: List 2-3 key weaknesses.
+    * \`suggestions\`: Provide 2-3 actionable suggestions for improvement.
 
-    最后提醒：分析视频，并以中文提供JSON输出（"transcription"除外）。
-  `;
+6.  **Video Tagging:**
+    * \`videoType\`: Classify as either "口播视频" (presenter-led) or "配音视频" (voice-over).
+    * \`emotionalTone\`: Describe the dominant emotional tone (e.g., "情绪饱满", "专业冷静", "焦虑不安").
+    * \`coreContentAngle\`: Identify the single, most central topic or angle of the video (e.g., "产品成分深度解析", "痘痘肌急救指南", "热门产品吐槽").
+    * \`otherTags\`: Provide 2-3 other relevant tags (e.g., "干货分享", "剧情演绎", "前后对比").
 
-  const videoPart = { inlineData: { data: buffer.toString("base64"), mimeType: "video/mp4" } };
-  const contents = [{ role: 'user', parts: [{ text: prompt }, videoPart] }];
+**Input:**
+The system will provide only a video file (no keyframe images). Base your visual analysis (\`isVisuallyStrong\`, etc.) solely on the video content.
 
-  const safetySettings = [
-    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-  ];
+**Output:**
+You MUST return a single JSON object matching the provided schema. Do not add any extra text or explanations.`;
+
+  const prompt = '请分析这个视频，并根据schema返回JSON。';
+
+  const videoPart = { inlineData: { data: buffer.toString('base64'), mimeType: 'video/mp4' } };
+  const contents = { parts: [videoPart, { text: prompt }] };
 
   const result = await genAI.models.generateContent({
-    model: "gemini-2.5-pro",
-    contents: contents,
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: ANALYSIS_RESPONSE_SCHEMA,
+    model: 'gemini-2.5-flash',
+    contents,
+    config: {
+      responseMimeType: 'application/json',
+      temperature: 0.2,
+      responseSchema: NEW_ANALYSIS_RESPONSE_SCHEMA,
+      systemInstruction,
     },
-    safetySettings,
   });
-  
-  const rawText = result.response.text();
-  if (!rawText) throw new Error("analyzeSingleVideo: Gemini returned empty content.");
+
+  console.log(`[DEBUG] Record ${feishuRecordId}: analyzeVideoWithSchema - Gemini raw result: ${JSON.stringify(result, null, 2)}`);
+
+  let rawText;
+  if (result?.text) {
+    rawText = result.text.trim();
+  } else if (result.response) {
+    rawText = result.response.text();
+  } else if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+    console.warn(`[WARN] Record ${feishuRecordId}: analyzeVideoWithSchema - Missing response. Fallback to candidates.`);
+    rawText = result.candidates[0].content.parts[0].text;
+    const m = rawText.match(/```(?:json)?\n([\s\S]*?)\n```/);
+    if (m && m[1]) rawText = m[1];
+  } else {
+    throw new Error('analyzeVideoWithSchema: Gemini returned no content');
+  }
+
+  if (!rawText) throw new Error('analyzeVideoWithSchema: Empty content');
+
+  // 打印 Gemini 返回的原始文本内容（未经解析的完整字符串）
+  try {
+    console.log(`[DEBUG] Record ${feishuRecordId}: analyzeVideoWithSchema - Gemini raw text (as-is):\n${rawText}`);
+  } catch (_) {
+    // 忽略日志异常
+  }
 
   try {
-    const analysis = JSON.parse(rawText);
-    const scores = analysis.score;
-    const finalScore = (scores.opening_appeal.score * 0.2) +
-                       (scores.product_highlights.score * 0.3) +
-                       (scores.use_case_scenarios.score * 0.2) +
-                       (scores.call_to_action.score * 0.2) +
-                       (scores.fluency_and_emotion.score * 0.1);
-
-    const translatedScript = await translateScript(genAI, analysis.script);
-
-    return {
-      script: translatedScript,
-      score: Math.round(finalScore),
-      tags: analysis.tags,
-    };
+    const parsed = JSON.parse(rawText);
+    // 打印解析后的 JSON（与 schema 对应）
+    try {
+      console.log(`[DEBUG] Record ${feishuRecordId}: analyzeVideoWithSchema - Parsed JSON:\n${JSON.stringify(parsed, null, 2)}`);
+    } catch (_) {}
+    return parsed;
   } catch (e) {
-    throw new Error(`analyzeSingleVideo: Failed to parse or process analysis. Raw response: "${rawText.slice(0, 100)}...". Error: ${e.message}`);
+    throw new Error(`analyzeVideoWithSchema: JSON parse failed. Head: ${rawText.slice(0, 500)}...`);
   }
 }
 
@@ -242,6 +241,24 @@ async function getFieldMeta(appToken, tableId, accessToken) {
   } catch (e) {
     throw new Error(`Get fields meta failed: ${resp.status} ${resp.statusText} ${text?.slice(0,200)}`);
   }
+}
+
+async function ensureTextField(appToken, tableId, accessToken, fieldName) {
+  const fields = await getFieldMeta(appToken, tableId, accessToken);
+  if (fields.some((f) => f.field_name === fieldName)) return;
+  const resp = await fetch(`https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/fields`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ field_name: fieldName, type: 1 }),
+  });
+  const text = await resp.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Create field '${fieldName}' failed: ${resp.status} ${resp.statusText} ${text?.slice(0,200)}`);
+  }
+  if (data.code !== 0) throw new Error(`Create field '${fieldName}' failed: ${data.msg}`);
 }
 
 async function getOrCreateMultiSelectField(appToken, tableId, accessToken) {
@@ -337,6 +354,166 @@ async function updateRecord(appToken, tableId, recordId, fields, accessToken) {
   if (data.code !== 0) throw new Error(`Update record failed: ${data.msg}`);
 }
 
+function formatSubtitlesAndAnalysis(result) {
+  const groups = Array.isArray(result?.subtitle_groups) ? result.subtitle_groups : [];
+  if (!groups.length) return '';
+
+  const purposeIcon = (purpose) => {
+    const p = String(purpose || '').toLowerCase();
+    if (!p) return '';
+    if (p.includes('建立信任') || p.includes('trust')) return '🤝 ';
+    if (p.includes('制造紧迫感') || p.includes('紧迫') || p.includes('urgency')) return '⏰ ';
+    if (p.includes('吸引注意') || p.includes('钩子') || p.includes('hook')) return '🎣 ';
+    if (p.includes('引导互动') || p.includes('互动') || p.includes('engagement')) return '💬 ';
+    if (p.includes('行动号召') || p.includes('cta') || p.includes('下单') || p.includes('购买')) return '👉 ';
+    if (p.includes('证明') || p.includes('背书') || p.includes('evidence') || p.includes('proof')) return '✅ ';
+    return '';
+  };
+
+  const lines = [];
+  lines.push('## 字幕与分析');
+  const highlightCount = groups.filter(g => g?.isVisuallyStrong).length;
+  lines.push(`- 片段数: ${groups.length} | 高光片段: ${highlightCount}`);
+
+  groups.forEach((segment, idx) => {
+    const start = segment.startTime || '??:??';
+    const end = segment.endTime || '??:??';
+    const isStrong = !!segment.isVisuallyStrong;
+    const badge = isStrong ? ' 🌟 高光' : '';
+    lines.push('', `### [${start} - ${end}]${badge}`);
+
+    if (isStrong && segment.visualStrengthReason) {
+      lines.push(`- 高光理由: ${segment.visualStrengthReason}`);
+    }
+    if (isStrong && segment.highlightSummary) {
+      lines.push(`- 高光片段: ${segment.highlightSummary}`);
+    }
+
+    if (segment.text) lines.push(`- 原文: ${segment.text}`);
+    if (segment.translation) lines.push(`- 译文: ${segment.translation}`);
+    if (segment.summary) lines.push(`- 总结: ${segment.summary}`);
+    if (segment.purpose) lines.push(`- 目的: ${purposeIcon(segment.purpose)}${segment.purpose}`);
+
+    if (idx < groups.length - 1) {
+      lines.push('', '---');
+    }
+  });
+
+  return lines.join('\n');
+}
+
+function formatVideoStructureAndAnalysis(result) {
+  const vs = result?.video_structure;
+  if (!vs) return '';
+
+  const getIconForPart = (name = '') => {
+    const n = String(name).toLowerCase();
+    if (/(hook|钩子)/.test(n)) return '🎣';
+    if (/(pain|problem|痛点|问题)/.test(n)) return '❓';
+    if (/(product|展示|方案|演示|种草|推荐)/.test(n)) return '🧴';
+    if (/(proof|evidence|背书|案例|证明)/.test(n)) return '✅';
+    if (/(compare|对比|前后|before|after)/.test(n)) return '🔀';
+    if (/(transition|转场|过渡|节奏)/.test(n)) return '⏩';
+    if (/(summary|总结|复盘|收束)/.test(n)) return '🧾';
+    if (/(cta|call to action|行动|号召|购买|下单)/.test(n)) return '👉';
+    return '📌';
+  };
+
+  const escapePipes = (text) => String(text ?? '').replace(/\|/g, '\\|');
+
+  const lines = [];
+  lines.push('## 视频结构与分析');
+  lines.push('', '### 黄金3秒分析（不足与建议）');
+  lines.push(vs.golden_3s_hook_analysis || '（无）');
+
+  const segs = Array.isArray(vs.segments) ? vs.segments : [];
+  if (segs.length > 0) {
+    lines.push('', '---', '', '### 内容结构');
+    if (segs.length <= 12) {
+      // 表格模式
+      lines.push('| 时间段 | 模块 | 描述 |');
+      lines.push('| --- | --- | --- |');
+      for (const seg of segs) {
+        const time = seg?.timeRange || '00:00 - 00:00';
+        const name = seg?.partName || '';
+        const icon = getIconForPart(name);
+        const desc = escapePipes(seg?.description || '（无）');
+        lines.push(`| ${escapePipes(time)} | ${icon} ${escapePipes(name)} | ${desc} |`);
+      }
+    } else {
+      // 列表模式
+      for (const seg of segs) {
+        const time = seg?.timeRange || '00:00 - 00:00';
+        const name = seg?.partName || '';
+        const icon = getIconForPart(name);
+        lines.push('', `#### [${time}] ${icon} ${name}`.trim());
+        lines.push(`- 描述: ${seg?.description || '（无）'}`);
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function formatOverallScriptEvaluation(result) {
+  const lines = [];
+  lines.push('## 整体脚本评估');
+
+  // 顶部得分与理由
+  const score = result?.overall_score;
+  const rationale = result?.score_rationale;
+  if (typeof score === 'number') {
+    lines.push(`- **综合得分**: ${score}/100`);
+  }
+  if (rationale) {
+    lines.push(`- **评分理由**: ${rationale}`);
+  }
+
+  const sa = result?.script_analysis || {};
+
+  // 适用营销阶段
+  if (sa.marketing_stage_summary) {
+    lines.push('', '### 适用营销阶段');
+    lines.push(`- ${sa.marketing_stage_summary}`);
+  }
+
+  // 核心问题
+  if (sa.negativeSummary) {
+    lines.push('', '### 核心问题');
+    lines.push(`- ⚠️ ${sa.negativeSummary}`);
+  }
+
+  // 优点
+  if (Array.isArray(sa.strengths) && sa.strengths.length) {
+    lines.push('', '### 优点');
+    sa.strengths.forEach((s) => lines.push(`- ${s}`));
+  }
+
+  // 缺点
+  if (Array.isArray(sa.weaknesses) && sa.weaknesses.length) {
+    lines.push('', '### 缺点');
+    sa.weaknesses.forEach((w) => lines.push(`- ${w}`));
+  }
+
+  // 优化建议
+  if (Array.isArray(sa.suggestions) && sa.suggestions.length) {
+    lines.push('', '### 优化建议');
+    sa.suggestions.forEach((s) => lines.push(`- ${s}`));
+  }
+
+  // 标签信息
+  const vt = result?.video_tags;
+  if (vt && (vt.videoType || vt.emotionalTone || vt.coreContentAngle || (Array.isArray(vt.otherTags) && vt.otherTags.length))) {
+    lines.push('', '### 标签信息');
+    if (vt.videoType) lines.push(`- 视频类型: ${vt.videoType}`);
+    if (vt.emotionalTone) lines.push(`- 情绪基调: ${vt.emotionalTone}`);
+    if (vt.coreContentAngle) lines.push(`- 核心角度: ${vt.coreContentAngle}`);
+    if (Array.isArray(vt.otherTags) && vt.otherTags.length) lines.push(`- 其他标签: ${vt.otherTags.join(' · ')}`);
+  }
+
+  return lines.join('\n');
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
   try {
@@ -346,6 +523,8 @@ export default async function handler(req, res) {
     const { feishuRecordId, videoId, env, accessToken } = body || {};
     if (!feishuRecordId || !videoId || !env) return res.status(200).json({ success: true, message: 'Skip: missing body' });
 
+    console.log(`[INFO] Received analysis task for feishuRecordId: ${feishuRecordId}, videoId: ${videoId}`);
+
     const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY);
 
     let buffer;
@@ -353,107 +532,73 @@ export default async function handler(req, res) {
       buffer = await fetchVideoBufferById(videoId);
     } catch (e) {
       // 下载失败：写失败原因到 是否发起分析
+      console.error(`[ERROR] Record ${feishuRecordId}: Failed to download video. Error: ${e.message}`);
       if (accessToken) {
         await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': `下载失败: ${e.message}` }, accessToken);
       }
       return res.json({ success: false, error: e.message });
     }
 
+    // 上传视频到飞书附件字段：TK视频内容（不阻塞后续分析）
+    if (accessToken) {
+      try {
+        const filename = `${videoId}.mp4`;
+        console.log(`[INFO] Record ${feishuRecordId}: Uploading video to Feishu (medias.upload_all) as '${filename}'...`);
+        const fileToken = await uploadVideoToFeishu(buffer, filename, accessToken, env.FEISHU_APP_TOKEN);
+        if (fileToken) {
+          await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, {
+            'TK视频内容': [ { file_token: fileToken, name: filename } ]
+          }, accessToken);
+          console.log(`[INFO] Record ${feishuRecordId}: Video attachment uploaded and record updated.`);
+        }
+      } catch (e) {
+        console.error(`[ERROR] Record ${feishuRecordId}: Failed to upload video attachment: ${e.message}`);
+      }
+    }
+
     // 分析
     let result;
     try {
-      result = await analyzeSingleVideo(genAI, buffer);
+      console.log(`[INFO] Record ${feishuRecordId}: Starting analysis...`);
+      // result = await analyzeSingleVideo(genAI, buffer, feishuRecordId);
+      result = await analyzeVideoWithSchema(genAI, buffer, feishuRecordId);
+      console.log(`[INFO] Record ${feishuRecordId}: Analysis finished.`);
     } catch (e) {
+      console.error(`[ERROR] Record ${feishuRecordId}: Analysis failed. Error: ${e.message}`);
       if (accessToken) {
         await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': `分析失败: ${e.message}` }, accessToken);
       }
       return res.json({ success: false, error: e.message });
     }
 
-    // 处理标签（规范化、截断到10字）
-    const rawTags = Array.isArray(result.tags) ? result.tags : [];
-    const correctedTags = await validateAndCorrectTags(genAI, rawTags);
-    
-    const cleanTags = Array.from(new Set(correctedTags.map((t) => String(t).trim()).filter(Boolean)))
-      .map((t) => (t.length > 10 ? t.slice(0, 10) : t));
-
-    // 确定用于写入标签的目标字段（若原“视频标签”不是多选，则自动创建“视频标签（多选）”）
-    let tagTarget = { fieldId: null, fieldName: '视频标签' };
-    if (accessToken) {
-      try {
-        tagTarget = await getOrCreateMultiSelectField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken);
-      } catch (e) {
-        // 若创建失败，则仍尝试用原显示名写文本（不推荐，但保证流程不中断）
-        tagTarget = { fieldId: null, fieldName: '视频标签' };
-      }
-    }
-
-    // --- Step 1: Ensure options exist ---
-    if (accessToken && tagTarget.fieldId && cleanTags.length > 0) {
-      console.log(`[DEBUG] Record ${feishuRecordId}: About to ensure options for tags: ${JSON.stringify(cleanTags)}`);
-      await ensureMultiSelectOptions(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, tagTarget.fieldId, cleanTags, accessToken);
-      console.log(`[DEBUG] Record ${feishuRecordId}: Successfully ensured options.`);
-      
-      // 为解决飞书API最终一致性问题，在更新选项后增加3秒延迟
-      console.log(`[DEBUG] Record ${feishuRecordId}: Waiting 3 seconds for API propagation...`);
-      await new Promise(r => setTimeout(r, 3000));
-    }
-
     // --- Step 2: Update the record ---
-    let formattedScript = "";
-    if (Array.isArray(result.script)) {
-        formattedScript = result.script.map(segment => {
-            const header = `### 🕒 ${segment.startTime || '??:??'} - ${segment.endTime || '??:??'}`;
-            const transcriptionText = `**口播内容**: ${segment.transcription || '（无）'}`;
-            const screenDescriptionText = `**画面描述**: ${segment.screen_description || '（无）'}`;
-            const summaryText = `**片段总结**: ${segment.summary || '（无）'}`;
-            return `${header}\n${transcriptionText}\n${screenDescriptionText}\n${summaryText}`;
-        }).join('\n\n---\n\n');
-    } else {
-        // Fallback for old format or unexpected string
-        formattedScript = String(result.script || '');
+    const subtitlesAndAnalysisText = formatSubtitlesAndAnalysis(result);
+    const structureAndAnalysisText = formatVideoStructureAndAnalysis(result);
+    const overallEvaluationText = formatOverallScriptEvaluation(result);
+
+    // 确保目标文本字段存在
+    if (accessToken) {
+      await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '字幕与分析');
+      await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '视频结构与分析');
+      await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '整体脚本评估');
+      // 可选：确保状态字段存在
+      await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '是否发起分析');
     }
+
     const fieldsToUpdate = {
-      '视频脚本': formattedScript,
-      '视频得分': String(Math.max(0, Math.min(100, Math.round(result.score))))
+      '字幕与分析': subtitlesAndAnalysisText,
+      '视频结构与分析': structureAndAnalysisText,
+      '整体脚本评估': overallEvaluationText,
+      '是否发起分析': '已分析',
     };
-    
-    if (cleanTags.length > 0) {
-      fieldsToUpdate[tagTarget.fieldName] = cleanTags;
-      try {
-        console.log(`[DEBUG] Record ${feishuRecordId}: About to update record with fields: ${JSON.stringify(fieldsToUpdate)}`);
+
         if (accessToken) {
           await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, fieldsToUpdate, accessToken);
-        }
-        console.log(`[DEBUG] Record ${feishuRecordId}: Successfully updated record with multi-select tags.`);
-      } catch (e) {
-        console.error(`[DEBUG] Record ${feishuRecordId}: FAILED to update with multi-select format. Error: ${e.message}`);
-        console.log(`[DEBUG] Record ${feishuRecordId}: Falling back to writing tags as plain text.`);
-        
-        // 多选写入失败，回退到文本写入
-        delete fieldsToUpdate[tagTarget.fieldName];
-        fieldsToUpdate[tagTarget.fieldName] = cleanTags.join(' / ');
-        
-        try {
-          console.log(`[DEBUG] Record ${feishuRecordId}: About to update record with fallback text format: ${JSON.stringify(fieldsToUpdate)}`);
-          if (accessToken) {
-            await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, fieldsToUpdate, accessToken);
-          }
-          console.log(`[DEBUG] Record ${feishuRecordId}: Successfully updated record with fallback text format.`);
-        } catch (e2) {
-          console.error(`[DEBUG] Record ${feishuRecordId}: FAILED to update with fallback text format. Error: ${e2.message}`);
-        }
-      }
-    } else {
-      // 只写入脚本和得分
-      if (accessToken) {
-        await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, fieldsToUpdate, accessToken);
-      }
     }
 
     return res.json({ success: true });
   } catch (error) {
-    console.error(error);
+    console.error('[FATAL] Unhandled error in handler:', error);
     return res.status(500).json({ error: error.message });
   }
 };
