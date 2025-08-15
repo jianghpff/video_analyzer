@@ -411,22 +411,115 @@ const SCHEMA_STAGE_B = {
   required: ['consumer_pillars'],
 };
 
-async function analyzeStageA(genAI, buffer, feishuRecordId) {
-  const systemInstruction = `You are an expert short-form video script analyst for TikTok skincare. Return JSON strictly matching the provided schema for Stage A (basic analysis). All analysis in Simplified Chinese.`;
-  const prompt = '请进行阶段A基础分析，并严格按schema返回JSON（简体中文）';
+// 统一处理：剥离 Markdown 代码块围栏
+function stripCodeFences(text) {
+  try {
+    if (typeof text !== 'string') return '';
+    const m = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    return (m && m[1] ? m[1] : text).trim();
+  } catch (_) { return ''; }
+}
+
+// 统一处理：从结果对象中尽可能稳健地提取文本；并输出可观测性快照
+function extractTextWithSnapshot(result, feishuRecordId, stageLabel = 'Stage') {
+  try {
+    // 优先通道
+    if (result && typeof result.text === 'string' && result.text.trim()) {
+      return stripCodeFences(result.text);
+    }
+    if (result && result.response && typeof result.response.text === 'function') {
+      const t = result.response.text();
+      if (t && typeof t === 'string' && t.trim()) return stripCodeFences(t);
+    }
+
+    // 遍历 candidates[*].content.parts[*].text
+    const candidates = (result && result.response && Array.isArray(result.response.candidates))
+      ? result.response.candidates
+      : (Array.isArray(result?.candidates) ? result.candidates : []);
+
+    const collected = [];
+    const snapshot = {
+      candidatesCount: Array.isArray(candidates) ? candidates.length : 0,
+      candidates: [],
+    };
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i] || {};
+      const parts = (c.content && Array.isArray(c.content.parts)) ? c.content.parts : [];
+      const partInfo = [];
+      for (let j = 0; j < parts.length; j++) {
+        const p = parts[j] || {};
+        const hasText = typeof p.text === 'string' && p.text.trim().length > 0;
+        if (hasText) collected.push(p.text);
+        const typeGuess = hasText ? 'text' : (Object.keys(p)[0] || 'unknown');
+        partInfo.push({ idx: j, type: typeGuess, hasText, textLen: hasText ? p.text.length : 0 });
+      }
+      snapshot.candidates.push({
+        idx: i,
+        finishReason: c.finishReason || c.finish_reason || null,
+        safety: c.safetyRatings || c.safety || null,
+        partsCount: parts.length,
+        parts: partInfo,
+      });
+    }
+
+    try { console.log(`[DEBUG] Record ${feishuRecordId}: ${stageLabel} snapshot`, JSON.stringify(snapshot)); } catch (_) {}
+
+    // 选择最可能是 JSON 的文本
+    let chosen = '';
+    for (const t of collected) {
+      const stripped = stripCodeFences(t);
+      const s = stripped.trim();
+      if (!s) continue;
+      if (s.startsWith('{') || s.startsWith('[')) { chosen = s; break; }
+      if (!chosen) chosen = s; // 兜底取第一个非空
+    }
+    return chosen || '';
+  } catch (e) {
+    try { console.warn(`[WARN] Record ${feishuRecordId}: ${stageLabel} extract error: ${e.message}`); } catch (_) {}
+    return '';
+  }
+}
+
+async function generateWithRetry(genAI, req, feishuRecordId, stageLabel = 'Stage') {
+  // 首次尝试
+  let result = await genAI.models.generateContent(req);
+  let rawText = extractTextWithSnapshot(result, feishuRecordId, stageLabel);
+  if (rawText) return rawText;
+  try { console.warn(`[WARN] Record ${feishuRecordId}: ${stageLabel} empty content on first attempt, retrying once...`); } catch (_) {}
+  // 保持相同 schema/温度，重试一次
+  const result2 = await genAI.models.generateContent(req);
+  rawText = extractTextWithSnapshot(result2, feishuRecordId, stageLabel);
+  if (!rawText) {
+    try {
+      const snapshot2 = {
+        hasResponse: !!result2?.response,
+        candidateCount: Array.isArray(result2?.response?.candidates) ? result2.response.candidates.length : (Array.isArray(result2?.candidates) ? result2.candidates.length : 0),
+        finishReasons: (result2?.response?.candidates || result2?.candidates || []).map(c => c?.finishReason || c?.finish_reason || null),
+      };
+      console.error(`[ERROR] Record ${feishuRecordId}: ${stageLabel} empty content after retry`, JSON.stringify(snapshot2));
+    } catch (_) {}
+  }
+  return rawText || '';
+}
+
+async function analyzeStageA(genAI, buffer, feishuRecordId, model = 'gemini-2.5-flash') {
+  const systemInstruction = `You are an expert short-form video script analyst for TikTok skincare. Return JSON strictly matching the provided schema for Stage A (basic analysis). All analysis in Simplified Chinese.
+
+Scoring rule (MANDATORY): All scores MUST be integers in the range 0-100. DO NOT use 10-point or 1-point scales. DO NOT return decimals.`;
+  const prompt = '请进行阶段A基础分析，并严格按schema返回JSON（简体中文）。评分必须是0-100的整数；不得使用10分制或1分制；不得返回小数。';
   const videoPart = { inlineData: { data: buffer.toString('base64'), mimeType: 'video/mp4' } };
   const contents = { parts: [videoPart, { text: prompt }] };
-  const result = await genAI.models.generateContent({
-    model: 'gemini-2.5-flash',
+  const req = {
+    model,
     contents,
     config: { responseMimeType: 'application/json', temperature: 0.0, responseSchema: SCHEMA_STAGE_A, systemInstruction },
-  });
-  let rawText = result?.text?.trim() || (result.response && result.response.text()) || result?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  if (!rawText) throw new Error('StageA: Empty content');
+  };
+  const rawText = await generateWithRetry(genAI, req, feishuRecordId, 'StageA');
+  if (!rawText) throw new Error('StageA: Empty content (after retry)');
   try { return JSON.parse(rawText); } catch (e) { throw new Error(`StageA parse failed. Head: ${rawText.slice(0,200)}...`); }
 }
 
-async function analyzeStageB(genAI, buffer, feishuRecordId) {
+async function analyzeStageB(genAI, buffer, feishuRecordId, model = 'gemini-2.5-flash') {
   const systemInstruction = `你是短视频消费者感知评估专家。仅进行“阶段B：三支柱/红旗/V3标签”分析；全部用简体中文；严格匹配 schema。
 
 评分标尺（务必遵守）：
@@ -440,18 +533,67 @@ async function analyzeStageB(genAI, buffer, feishuRecordId) {
 
 红旗：返回数组 [{name, hit, severity, notes}]；name 限定：不公平对比/医疗化或夸大承诺/纯广告感强或噪声大或SKU混乱/全程无实拍或素材堆叠/合规_医疗暗示或虚假承诺。
 
-V3标签：仅输出命中标签，扁平到 v3_labels_flat 的“[维度]--[二级维度]-[TAG]”；并在 v3_label_bases 返回 {label,basis}。`;
+V3标签：仅输出命中标签，扁平到 v3_labels_flat 的“[维度]--[二级维度]-[TAG]”；并在 v3_label_bases 返回 {label,basis}。
+
+评分规则（强制）：所有分数必须是0-100的整数；不得使用10分制或1分制；不得返回小数。`;
   const prompt = '请进行阶段B分析（三支柱/红旗/V3标签），并严格按schema返回JSON（简体中文）。三支柱请按命中率→微调→一致性约束的流程得出分数，并返回 score_basis。';
   const videoPart = { inlineData: { data: buffer.toString('base64'), mimeType: 'video/mp4' } };
   const contents = { parts: [videoPart, { text: prompt }] };
-  const result = await genAI.models.generateContent({
-    model: 'gemini-2.5-flash',
+  const req = {
+    model,
     contents,
     config: { responseMimeType: 'application/json', temperature: 0.0, responseSchema: SCHEMA_STAGE_B, systemInstruction },
-  });
-  let rawText = result?.text?.trim() || (result.response && result.response.text()) || result?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  if (!rawText) throw new Error('StageB: Empty content');
+  };
+  const rawText = await generateWithRetry(genAI, req, feishuRecordId, 'StageB');
+  if (!rawText) throw new Error('StageB: Empty content (after retry)');
   try { return JSON.parse(rawText); } catch (e) { throw new Error(`StageB parse failed. Head: ${rawText.slice(0,200)}...`); }
+}
+
+async function postProcessAndScore(merged, feishuRecordId) {
+  // 复用 handler 中的后处理逻辑，保持一致性
+  let raw = JSON.stringify(merged);
+  const parsed = JSON.parse(raw);
+  // 功能性分
+  const pe = parsed?.panel_evaluation || {};
+  const hs = typeof pe?.hook?.score === 'number' ? pe.hook.score : null;
+  const ps = typeof pe?.pitch?.score === 'number' ? pe.pitch.score : null;
+  const cs = typeof pe?.close?.score === 'number' ? pe.close.score : null;
+  if (hs !== null && ps !== null && cs !== null) parsed.functional_score = Math.round(hs*0.4 + ps*0.4 + cs*0.2);
+  // 感知分
+  const cp = parsed?.consumer_pillars || {};
+  const p1 = typeof cp?.pillar1_authenticity_trust?.score === 'number' ? cp.pillar1_authenticity_trust.score : null;
+  const p2 = typeof cp?.pillar2_value_persuasion?.score === 'number' ? cp.pillar2_value_persuasion.score : null;
+  const p3 = typeof cp?.pillar3_conversion_readiness?.score === 'number' ? cp.pillar3_conversion_readiness.score : null;
+  if (p1!==null && p2!==null && p3!==null) parsed.perception_score = Math.round(p1*0.5 + p2*0.3 + p3*0.2);
+  // 融合
+  const fs = parsed.functional_score; const ps2 = parsed.perception_score;
+  let fused = null; if (typeof fs==='number' && typeof ps2==='number') fused = Math.round(fs*0.5 + ps2*0.5); else if (typeof fs==='number') fused = fs; else if (typeof ps2==='number') fused = ps2;
+  // 红旗
+  let penalty = 0; let cap = 100;
+  const rfArr = Array.isArray(parsed.red_flags) ? parsed.red_flags : [];
+  const findHit = (name) => rfArr.find(x=>x&&x.name===name && x.hit===true);
+  const applyPenalty=(item,r)=>{ if(!item) return; const sev=String(item.severity||'').toLowerCase(); if(sev.includes('high')) penalty+=r.high; else if(sev.includes('mid')) penalty+=r.mid; else if(sev.includes('low')) penalty+=r.low; };
+  const unfair=findHit('不公平对比'); applyPenalty(unfair,{low:-10,mid:-15,high:-20}); if(unfair) cap=Math.min(cap,60);
+  const medical=findHit('医疗化或夸大承诺'); applyPenalty(medical,{low:-15,mid:-20,high:-30}); if(medical) cap=Math.min(cap,50);
+  const adlike=findHit('纯广告感强或噪声大或SKU混乱'); applyPenalty(adlike,{low:-5,mid:-10,high:-15});
+  const noLive=findHit('全程无实拍或素材堆叠'); applyPenalty(noLive,{low:-10,mid:-15,high:-20}); if(noLive) cap=Math.min(cap,60);
+  const compliance=findHit('合规_医疗暗示或虚假承诺'); if(compliance) cap=Math.min(cap,50);
+  if (typeof fused==='number') { const after=Math.max(0,Math.min(100,fused+penalty)); parsed.final_score=Math.min(after,cap); parsed.overall_score=parsed.final_score; }
+  return parsed;
+}
+
+async function runFullAnalysisWithModel(genAI, buffer, feishuRecordId, modelName) {
+  const a = await analyzeStageA(genAI, buffer, feishuRecordId, modelName);
+  let b = {};
+  try {
+    b = await analyzeStageB(genAI, buffer, feishuRecordId, modelName);
+  } catch (e) {
+    try { console.warn(`[WARN] Record ${feishuRecordId}: StageB failed on ${modelName}: ${e.message}`); } catch (_) {}
+    b = { degrade: true };
+  }
+  const merged = { ...a, ...b };
+  const scored = await postProcessAndScore(merged, feishuRecordId);
+  return scored;
 }
 
 async function analyzeVideoWithSchema(genAI, buffer, feishuRecordId) {
@@ -636,12 +778,85 @@ You MUST return a single JSON object matching the provided schema. Do not add an
     // 服务端重算功能性分与综合分（降低波动）
     try {
       const pe = parsed?.panel_evaluation || {};
-      const hs = typeof pe?.hook?.score === 'number' ? pe.hook.score : null;
-      const ps = typeof pe?.pitch?.score === 'number' ? pe.pitch.score : null;
-      const cs = typeof pe?.close?.score === 'number' ? pe.close.score : null;
-      if (hs !== null && ps !== null && cs !== null) {
-        const functionalScore = Math.round(hs * 0.4 + ps * 0.4 + cs * 0.2);
+      let hRaw = typeof pe?.hook?.score === 'number' ? pe.hook.score : null;
+      let pRaw = typeof pe?.pitch?.score === 'number' ? pe.pitch.score : null;
+      let cRaw = typeof pe?.close?.score === 'number' ? pe.close.score : null;
+
+      // 分制识别：若疑似 10 分制或 1 分制则整体放大
+      const maxDim = Math.max(
+        hRaw ?? -Infinity,
+        pRaw ?? -Infinity,
+        cRaw ?? -Infinity,
+      );
+      if (maxDim > -Infinity) {
+        if (maxDim > 0 && maxDim <= 1) {
+          if (hRaw !== null) hRaw *= 100;
+          if (pRaw !== null) pRaw *= 100;
+          if (cRaw !== null) cRaw *= 100;
+        } else if (maxDim > 0 && maxDim <= 10) {
+          if (hRaw !== null) hRaw *= 10;
+          if (pRaw !== null) pRaw *= 10;
+          if (cRaw !== null) cRaw *= 10;
+        }
+      }
+
+      const clampInt = (v) => {
+        if (typeof v !== 'number' || Number.isNaN(v)) return null;
+        return Math.max(0, Math.min(100, Math.round(v)));
+      };
+
+      // 统计 checklist 命中率（支持对象或数组两种格式）
+      const statsFromChecklist = (cl) => {
+        if (!cl) return { hits: 0, total: 0 };
+        if (Array.isArray(cl)) {
+          let hits = 0, total = 0;
+          for (const item of cl) {
+            if (!item || typeof item !== 'object') continue;
+            if (typeof item.hit === 'boolean') {
+              total++;
+              if (item.hit) hits++;
+            }
+          }
+          return { hits, total };
+        }
+        if (typeof cl === 'object') {
+          let hits = 0, total = 0;
+          for (const [k, v] of Object.entries(cl)) {
+            if (k.endsWith('说明')) continue;
+            if (v === true || v === false) {
+              total++;
+              if (v === true) hits++;
+            }
+          }
+          return { hits, total };
+        }
+        return { hits: 0, total: 0 };
+      };
+
+      const correctFunctionalDim = (raw, cl) => {
+        let used = clampInt(raw);
+        const { hits, total } = statsFromChecklist(cl);
+        if (total > 0) {
+          const base = Math.round((hits / total) * 100);
+          // 与 base 相差过大则回正（保守：不做额外微调）
+          if (used === null || Math.abs(used - base) > 15) used = clampInt(base);
+          // 一致性护栏
+          const rate = hits / total;
+          if (rate >= 0.3 && used < 20) used = 20;
+          if (rate <= 0.2 && used > 60) used = 60;
+        }
+        return used;
+      };
+
+      const hUsed = correctFunctionalDim(hRaw, pe?.hook?.checklist);
+      const pUsed = correctFunctionalDim(pRaw, pe?.pitch?.checklist);
+      const cUsed = correctFunctionalDim(cRaw, pe?.close?.checklist);
+
+      if (hUsed !== null && pUsed !== null && cUsed !== null) {
+        const functionalScore = Math.round(hUsed * 0.4 + pUsed * 0.4 + cUsed * 0.2);
         parsed.functional_score = functionalScore;
+        parsed.functional_components = { hook_raw: clampInt(hRaw), hook_used: hUsed, pitch_raw: clampInt(pRaw), pitch_used: pUsed, close_raw: clampInt(cRaw), close_used: cUsed };
+        try { console.log(`[DEBUG] Record ${feishuRecordId}: FS detail`, parsed.functional_components); } catch (_) {}
       }
       // 感知分：若模型给出三支柱得分，则计算 perception_score（并加入兜底回正）
       const cp = parsed?.consumer_pillars || {};
@@ -715,8 +930,23 @@ You MUST return a single JSON object matching the provided schema. Do not add an
 
       if (typeof fused === 'number') {
         const afterPenalty = Math.max(0, Math.min(100, fused + penalty));
+        parsed.fused_pre_penalty = fused;
+        parsed.penalty_total = penalty;
+        parsed.cap_applied = cap;
         parsed.final_score = Math.min(afterPenalty, cap);
         parsed.overall_score = parsed.final_score; // 向后兼容：覆盖 overall_score
+        try {
+          const rfDebug = rfArr && rfArr.length ? rfArr.filter(x => x && x.hit === true) : [];
+          console.log(`[DEBUG] Record ${feishuRecordId}: scoring detail`, {
+            functional_score: parsed.functional_score,
+            perception_score: parsed.perception_score,
+            fused_pre_penalty: parsed.fused_pre_penalty,
+            penalty_total: parsed.penalty_total,
+            cap_applied: parsed.cap_applied,
+            final_score: parsed.final_score,
+            red_flags_hits: rfDebug,
+          });
+        } catch (_) {}
       }
     } catch (_) {}
     return parsed;
@@ -972,6 +1202,16 @@ function formatOverallScriptEvaluation(result) {
     lines.push('', '### 分数拆解');
     if (typeof fs === 'number') lines.push(`- 功能性分: ${fs}/100（由 Hook/Pitch/Close 加权 40/40/20）`);
     if (typeof ps === 'number') lines.push(`- 感知分: ${ps}/100（由 真实与信任/价值与说服/转化准备度 加权 50/30/20）`);
+    const fusedPre = result?.fused_pre_penalty;
+    const pen = result?.penalty_total;
+    const cap = result?.cap_applied;
+    if (typeof fusedPre === 'number') lines.push(`- 融合前分: ${fusedPre}/100`);
+    if (typeof pen === 'number' && pen !== 0) lines.push(`- 红旗扣分: ${pen}`);
+    if (typeof cap === 'number' && cap < 100) lines.push(`- 分数上限: ${cap}`);
+    if (typeof fusedPre === 'number') {
+      const after = Math.max(0, Math.min(100, (fusedPre + (typeof pen === 'number' ? pen : 0))));
+      lines.push(`- 融合后分: ${Math.min(after, typeof cap === 'number' ? cap : 100)}/100`);
+    }
   }
 
   // 新增：三大板块评估（若存在）
@@ -1143,6 +1383,18 @@ function formatOverallScriptEvaluation(result) {
     }
   }
 
+  // 红旗与合规（若命中）
+  const rf = Array.isArray(result?.red_flags) ? result.red_flags.filter(x => x && x.hit) : [];
+  if (rf.length) {
+    lines.push('', '### 红旗与合规');
+    for (const item of rf) {
+      const name = item?.name || '未知红旗';
+      const sev = item?.severity || '';
+      const notes = item?.notes || '';
+      lines.push(`- ${name}${sev ? `（${sev}）` : ''}${notes ? `：${notes}` : ''}`);
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -1175,6 +1427,29 @@ export default async function handler(req, res) {
       return res.json({ success: false, error: e.message });
     }
 
+    // 输入前置校验：记录视频字节数与 mime；过小或过大提前失败，避免推给模型
+    try {
+      const size = buffer?.length || 0;
+      console.log(`[INFO] Record ${feishuRecordId}: Video buffer size=${size} bytes, mime=video/mp4`);
+      // 经验阈值：小于 8KB 视为无效；大于 150MB 拒绝
+      const MIN_BYTES = 8 * 1024;
+      const MAX_BYTES = 150 * 1024 * 1024;
+      if (size < MIN_BYTES) {
+        const msg = `视频无效：体积过小(${size} bytes)`;
+        if (accessToken && !disableFeishu) {
+          await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': msg }, accessToken);
+        }
+        return res.json({ success: false, error: msg });
+      }
+      if (size > MAX_BYTES) {
+        const msg = `视频超限：体积过大(${Math.round(size/1024/1024)} MB)`;
+        if (accessToken && !disableFeishu) {
+          await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': msg }, accessToken);
+        }
+        return res.json({ success: false, error: msg });
+      }
+    } catch (_) {}
+
     // 上传视频到飞书附件字段：TK视频内容（不阻塞后续分析）
     if (accessToken && !disableFeishu) {
       try {
@@ -1192,59 +1467,36 @@ export default async function handler(req, res) {
       }
     }
 
-    // 分析
+    // 分析（支持 StageA 空内容的模型级 fallback）
     let result;
+    let primaryError = null;
     try {
-      console.log(`[INFO] Record ${feishuRecordId}: Starting analysis...`);
-      const a = await analyzeStageA(genAI, buffer, feishuRecordId);
-      let b = {};
-      try { b = await analyzeStageB(genAI, buffer, feishuRecordId); } catch (e) { console.warn(`[WARN] StageB failed: ${e.message}`); b = { degrade: true }; }
-      // 融合：A 为基础（保证字幕/结构用于飞书两字段），B 为三支柱等
-      result = { ...a, ...b };
-      // 后处理与打分（沿用原逻辑）
-      result = await (async () => {
-        const fake = { response: { text: () => JSON.stringify(result) } };
-        const merged = await (async () => {
-          // 复用解析与打分逻辑：借用 analyzeVideoWithSchema 的后半段
-          let raw = JSON.stringify(result);
-          const parsed = JSON.parse(raw);
-          // 功能性分
-          const pe = parsed?.panel_evaluation || {};
-          const hs = typeof pe?.hook?.score === 'number' ? pe.hook.score : null;
-          const ps = typeof pe?.pitch?.score === 'number' ? pe.pitch.score : null;
-          const cs = typeof pe?.close?.score === 'number' ? pe.close.score : null;
-          if (hs !== null && ps !== null && cs !== null) parsed.functional_score = Math.round(hs*0.4 + ps*0.4 + cs*0.2);
-          // 感知分
-          const cp = parsed?.consumer_pillars || {};
-          const p1 = typeof cp?.pillar1_authenticity_trust?.score === 'number' ? cp.pillar1_authenticity_trust.score : null;
-          const p2 = typeof cp?.pillar2_value_persuasion?.score === 'number' ? cp.pillar2_value_persuasion.score : null;
-          const p3 = typeof cp?.pillar3_conversion_readiness?.score === 'number' ? cp.pillar3_conversion_readiness.score : null;
-          if (p1!==null && p2!==null && p3!==null) parsed.perception_score = Math.round(p1*0.5 + p2*0.3 + p3*0.2);
-          // 融合
-          const fs = parsed.functional_score; const ps2 = parsed.perception_score;
-          let fused = null; if (typeof fs==='number' && typeof ps2==='number') fused = Math.round(fs*0.5 + ps2*0.5); else if (typeof fs==='number') fused = fs; else if (typeof ps2==='number') fused = ps2;
-          // 红旗
-          let penalty = 0; let cap = 100;
-          const rfArr = Array.isArray(parsed.red_flags) ? parsed.red_flags : [];
-          const findHit = (name) => rfArr.find(x=>x&&x.name===name && x.hit===true);
-          const applyPenalty=(item,r)=>{ if(!item) return; const sev=String(item.severity||'').toLowerCase(); if(sev.includes('high')) penalty+=r.high; else if(sev.includes('mid')) penalty+=r.mid; else if(sev.includes('low')) penalty+=r.low; };
-          const unfair=findHit('不公平对比'); applyPenalty(unfair,{low:-10,mid:-15,high:-20}); if(unfair) cap=Math.min(cap,60);
-          const medical=findHit('医疗化或夸大承诺'); applyPenalty(medical,{low:-15,mid:-20,high:-30}); if(medical) cap=Math.min(cap,50);
-          const adlike=findHit('纯广告感强或噪声大或SKU混乱'); applyPenalty(adlike,{low:-5,mid:-10,high:-15});
-          const noLive=findHit('全程无实拍或素材堆叠'); applyPenalty(noLive,{low:-10,mid:-15,high:-20}); if(noLive) cap=Math.min(cap,60);
-          const compliance=findHit('合规_医疗暗示或虚假承诺'); if(compliance) cap=Math.min(cap,50);
-          if (typeof fused==='number') { const after=Math.max(0,Math.min(100,fused+penalty)); parsed.final_score=Math.min(after,cap); parsed.overall_score=parsed.final_score; }
-          return parsed;
-        })();
-        return merged;
-      })();
-      console.log(`[INFO] Record ${feishuRecordId}: Analysis finished.`);
+      console.log(`[INFO] Record ${feishuRecordId}: Starting analysis with gemini-2.5-flash...`);
+      result = await runFullAnalysisWithModel(genAI, buffer, feishuRecordId, 'gemini-2.5-flash');
+      console.log(`[INFO] Record ${feishuRecordId}: Analysis finished on gemini-2.5-flash.`);
     } catch (e) {
-      console.error(`[ERROR] Record ${feishuRecordId}: Analysis failed. Error: ${e.message}`);
-      if (accessToken && !disableFeishu) {
-        await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': `分析失败: ${e.message}` }, accessToken);
+      primaryError = e;
+      const msg = String(e && e.message || '');
+      const isStageAEmpty = msg.includes('StageA: Empty content (after retry)');
+      if (isStageAEmpty) {
+        try { console.info(`[INFO] Record ${feishuRecordId}: Fallback to gemini-2.5-pro due to StageA empty content.`); } catch (_) {}
+        try {
+          result = await runFullAnalysisWithModel(genAI, buffer, feishuRecordId, 'gemini-2.5-pro');
+          console.log(`[INFO] Record ${feishuRecordId}: Analysis finished on gemini-2.5-pro.`);
+        } catch (e2) {
+          console.error(`[ERROR] Record ${feishuRecordId}: Fallback gemini-2.5-pro also failed: ${e2.message}`);
+          if (accessToken && !disableFeishu) {
+            await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': `分析失败: ${e2.message}` }, accessToken);
+          }
+          return res.json({ success: false, error: e2.message });
+        }
+      } else {
+        console.error(`[ERROR] Record ${feishuRecordId}: Analysis failed without fallback condition: ${e.message}`);
+        if (accessToken && !disableFeishu) {
+          await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, { '是否发起分析': `分析失败: ${e.message}` }, accessToken);
+        }
+        return res.json({ success: false, error: e.message });
       }
-      return res.json({ success: false, error: e.message });
     }
 
     // --- Step 2: Update the record ---

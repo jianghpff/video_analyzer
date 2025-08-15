@@ -69,6 +69,7 @@ async function searchVideoRecordsToProcess(env: Env, accessToken: string): Promi
       conjunction: 'and',
       conditions: [
         { field_name: 'Video ID', operator: 'isNotEmpty', value: [] },
+        { field_name: '是否发起分析', operator: 'isEmpty', value: [] },
       ],
     },
     page_size: 500,
@@ -139,6 +140,16 @@ async function getAccessTokenViaProxy(env: Env): Promise<string> {
   return token;
 }
 
+async function fetchRecordById(env: Env, accessToken: string, recordId: string): Promise<FeishuRecord | null> {
+  const url = `https://open.feishu.cn/open-apis/bitable/v1/apps/${env.FEISHU_APP_TOKEN}/tables/${env.FEISHU_TABLE_ID}/records/${recordId}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const data = await resp.json<any>().catch(() => ({}));
+  if (!resp.ok || data.code !== 0) return null;
+  const rec = data.data?.record;
+  if (!rec) return null;
+  return { record_id: rec.record_id, fields: rec.fields || {} };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === 'OPTIONS') return createCors({}, 200);
@@ -162,20 +173,46 @@ export default {
 
       // 调试模式：返回筛选前后关键信息，便于定位字段名或日期格式问题
       if (body && body.debug === true) {
-        const preview = candidates.slice(0, 10).map((rec) => {
+        // 支持按指定 record_id 精准预览：body.debugRecordIds = ["rec...", "rec..."]
+        const debugIdsRaw = Array.isArray(body.debugRecordIds) ? body.debugRecordIds : undefined;
+        const debugIdSet = debugIdsRaw ? new Set(debugIdsRaw.map((v: any) => String(v))) : undefined;
+        let picked: FeishuRecord[] = [];
+        if (debugIdSet) {
+          // 先从本页 candidates 命中
+          picked = candidates.filter((rec) => debugIdSet.has(String(rec.record_id)));
+          // 若仍缺失，则逐个直接从飞书按 record_id 拉取
+          const missing = Array.from(debugIdSet).filter((id) => !picked.some((p) => String(p.record_id) === String(id)));
+          for (const id of missing) {
+            const rec = await fetchRecordById(env, accessToken, id);
+            if (rec) picked.push(rec);
+          }
+        } else {
+          picked = candidates.slice(0, 10);
+        }
+
+        const preview = picked.map((rec) => {
           const timeText = extractText(rec.fields['Time']).trim();
           const dateOnly = parseBeijingDateOnly(timeText);
           const videoId = extractText(rec.fields['Video ID']).trim();
           const statusVal = extractText(rec.fields['是否发起分析']).trim();
+          const equalsYesterday = dateOnly === yesterday;
+          const reason_date_mismatch = !(equalsYesterday);
+          const reason_status_not_empty = !!statusVal;
+          const reason_videoid_empty = !videoId;
           return {
             record_id: rec.record_id,
             keys: Object.keys(rec.fields || {}),
             Time: timeText,
             dateOnly,
             yesterday,
-            equalsYesterday: dateOnly === yesterday,
+            equalsYesterday,
             videoId,
             status: statusVal,
+            reasons_not_selected: {
+              date_mismatch: reason_date_mismatch,
+              status_not_empty: reason_status_not_empty,
+              video_id_empty: reason_videoid_empty,
+            },
           };
         });
         return createCors({ success: true, candidates: candidates.length, selected: needProcess.length, preview });
