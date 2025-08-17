@@ -155,6 +155,16 @@ export default {
     if (request.method === 'OPTIONS') return createCors({}, 200);
     if (request.method !== 'POST') return createCors({ error: 'Use POST' }, 405);
 
+    // 路由分发：新增 /produce/by-date 入口（按单日或日期区间筛选）
+    try {
+      const { pathname } = new URL(request.url);
+      if (pathname === '/produce/by-date') {
+        return await handleProduceByDate(request, env, ctx);
+      }
+    } catch (_) {
+      // 非法 URL 忽略，继续走默认逻辑
+    }
+
     try {
       const body = await request.json<any>().catch(() => ({}));
       const accessToken: string = body.accessToken || (await getAccessTokenViaProxy(env));
@@ -183,7 +193,7 @@ export default {
           // 若仍缺失，则逐个直接从飞书按 record_id 拉取
           const missing = Array.from(debugIdSet).filter((id) => !picked.some((p) => String(p.record_id) === String(id)));
           for (const id of missing) {
-            const rec = await fetchRecordById(env, accessToken, id);
+            const rec = await fetchRecordById(env, accessToken, String(id));
             if (rec) picked.push(rec);
           }
         } else {
@@ -275,4 +285,129 @@ export default {
   },
 };
 
+
+// ======== 新增：按日期/日期区间筛选并入队 ========
+function normalizeInputDate(text: any): string | null {
+  if (!text || (typeof text !== 'string' && typeof text !== 'number')) return null;
+  const s = String(text).trim();
+  // 支持 YYYY-MM-DD 或 YYYY/MM/DD，只取日期部分
+  const m = s.match(/^(\d{4})[-\/]?(\d{2})[-\/]?(\d{2})/);
+  if (!m) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+function isDateWithin(dateOnly: string | null, start: string, end: string): boolean {
+  if (!dateOnly) return false;
+  // 均为 YYYY-MM-DD，可直接字典顺序比较
+  return dateOnly >= start && dateOnly <= end;
+}
+
+async function handleProduceByDate(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  try {
+    const body = await request.json<any>().catch(() => ({}));
+    const { date, startDate, endDate } = body || {};
+    const dryRun = !!body?.dryRun;
+    const limit = Number.isFinite(Number(body?.limit)) ? Math.max(0, Number(body.limit)) : undefined;
+    const markStatus = body?.markStatus === false ? false : true;
+    const debug = !!body?.debug;
+    const debugRecordIds = Array.isArray(body?.debugRecordIds) ? body.debugRecordIds.map((x: any) => String(x)) : undefined;
+
+    // 令牌：沿用现有代理
+    const accessToken: string = body?.accessToken || (await getAccessTokenViaProxy(env));
+
+    // 参数校验：单日与区间互斥
+    const single = normalizeInputDate(date);
+    const start = normalizeInputDate(startDate);
+    const end = normalizeInputDate(endDate);
+    const hasSingle = !!single;
+    const hasRange = !!(start && end);
+    if ((hasSingle && hasRange) || (!hasSingle && !hasRange)) {
+      return createCors({ success: false, error: 'Provide either date or (startDate + endDate)' }, 400);
+    }
+    if (hasRange && start! > end!) {
+      return createCors({ success: false, error: 'startDate must be <= endDate' }, 400);
+    }
+
+    // 1) 搜索候选（保持与默认入口一致）
+    const candidates = await searchVideoRecordsToProcess(env, accessToken);
+
+    // 2) 二次过滤：按日期/区间
+    const needProcessAll: FeishuRecord[] = [];
+    const previewAll: any[] = [];
+    for (const rec of candidates) {
+      const timeText = extractText(rec.fields['Time']).trim();
+      const dateOnly = parseBeijingDateOnly(timeText);
+      const videoId = extractText(rec.fields['Video ID']).trim();
+      const statusVal = extractText(rec.fields['是否发起分析']).trim();
+
+      const match = hasSingle
+        ? (dateOnly === single)
+        : isDateWithin(dateOnly, start!, end!);
+
+      const choose = match && !statusVal && !!videoId;
+      if (debug) {
+        previewAll.push({
+          record_id: rec.record_id,
+          Time: timeText,
+          dateOnly,
+          dateCriterion: hasSingle ? single : `${start}..${end}`,
+          withinRange: !!match,
+          videoId,
+          status: statusVal,
+          reasons_not_selected: choose ? {} : {
+            date_mismatch: !match,
+            status_not_empty: !!statusVal,
+            video_id_empty: !videoId,
+          },
+        });
+      }
+      if (choose) needProcessAll.push(rec);
+    }
+
+    // 按 limit 截断
+    const needProcess = typeof limit === 'number' && limit >= 0 ? needProcessAll.slice(0, limit) : needProcessAll;
+
+    if (dryRun || debug) {
+      const sample = debugRecordIds
+        ? previewAll.filter((p) => debugRecordIds.includes(String(p.record_id)))
+        : previewAll.slice(0, 20);
+      return createCors({
+        success: true,
+        candidates: candidates.length,
+        selected: needProcessAll.length,
+        selected_after_limit: needProcess.length,
+        preview: sample,
+      });
+    }
+
+    if (needProcess.length === 0) {
+      return createCors({ success: true, message: 'No records to enqueue' });
+    }
+
+    // 3) 入队前标记状态（可选）
+    if (markStatus) {
+      try {
+        await ensureTextField(env, accessToken, '是否发起分析');
+        const updates = needProcess.map((r) => ({ record_id: r.record_id, fields: { '是否发起分析': '是' } }));
+        await batchUpdateRecords(env, accessToken, updates);
+      } catch (_) {
+        // 字段创建或写入失败不阻塞入队
+      }
+    }
+
+    // 4) 入队
+    let enq = 0;
+    for (const rec of needProcess) {
+      const videoId = extractText(rec.fields['Video ID']).trim();
+      if (!videoId) continue;
+      const payload = { feishuRecordId: rec.record_id, videoId, env: { FEISHU_APP_TOKEN: env.FEISHU_APP_TOKEN, FEISHU_TABLE_ID: env.FEISHU_TABLE_ID }, accessToken };
+      ctx.waitUntil(env.VIDEO_ANALYSIS_QUEUE.send(payload, { contentType: 'json' }));
+      enq++;
+    }
+
+    return createCors({ success: true, enqueued: enq, selected: needProcess.length });
+  } catch (e: any) {
+    return createCors({ success: false, error: e.message }, 500);
+  }
+}
 

@@ -396,6 +396,10 @@ const SCHEMA_STAGE_A = {
     video_structure: NEW_ANALYSIS_RESPONSE_SCHEMA.properties.video_structure,
     script_analysis: NEW_ANALYSIS_RESPONSE_SCHEMA.properties.script_analysis,
     video_tags: NEW_ANALYSIS_RESPONSE_SCHEMA.properties.video_tags,
+    // 扩展：真人口播（当镜口述）判定增强（可选返回，向后兼容）
+    on_camera_speech: { type: Type.BOOLEAN },
+    on_camera_speech_basis: { type: Type.STRING },
+    on_camera_speech_segments: { type: Type.ARRAY, items: { type: Type.STRING } },
   },
   required: ['detected_language_code', 'subtitle_groups', 'script_analysis', 'video_structure'],
 };
@@ -506,7 +510,7 @@ async function analyzeStageA(genAI, buffer, feishuRecordId, model = 'gemini-2.5-
   const systemInstruction = `You are an expert short-form video script analyst for TikTok skincare. Return JSON strictly matching the provided schema for Stage A (basic analysis). All analysis in Simplified Chinese.
 
 Scoring rule (MANDATORY): All scores MUST be integers in the range 0-100. DO NOT use 10-point or 1-point scales. DO NOT return decimals.`;
-  const prompt = '请进行阶段A基础分析，并严格按schema返回JSON（简体中文）。评分必须是0-100的整数；不得使用10分制或1分制；不得返回小数。';
+  const prompt = '请进行阶段A基础分析，并严格按schema返回JSON（简体中文）。评分必须是0-100的整数；不得使用10分制或1分制；不得返回小数。\n\n额外要求（可选但建议返回）：\n- on_camera_speech（boolean）：是否“真人口播”（必须同时满足：真人出镜 + 现场收音/同期声；若为画外配音则为false）。\n- on_camera_speech_basis（string）：一句中文依据（为何判断为当镜口述/非当镜口述）。\n- on_camera_speech_segments（string[]）：当镜口述的大致时间段，如 \'00:03-00:06\'。';
   const videoPart = { inlineData: { data: buffer.toString('base64'), mimeType: 'video/mp4' } };
   const contents = { parts: [videoPart, { text: prompt }] };
   const req = {
@@ -578,7 +582,14 @@ async function postProcessAndScore(merged, feishuRecordId) {
   const adlike=findHit('纯广告感强或噪声大或SKU混乱'); applyPenalty(adlike,{low:-5,mid:-10,high:-15});
   const noLive=findHit('全程无实拍或素材堆叠'); applyPenalty(noLive,{low:-10,mid:-15,high:-20}); if(noLive) cap=Math.min(cap,60);
   const compliance=findHit('合规_医疗暗示或虚假承诺'); if(compliance) cap=Math.min(cap,50);
-  if (typeof fused==='number') { const after=Math.max(0,Math.min(100,fused+penalty)); parsed.final_score=Math.min(after,cap); parsed.overall_score=parsed.final_score; }
+  if (typeof fused==='number') {
+    const after=Math.max(0,Math.min(100,fused+penalty));
+    parsed.fused_pre_penalty = fused;
+    parsed.penalty_total = penalty;
+    parsed.cap_applied = cap;
+    parsed.final_score=Math.min(after,cap);
+    parsed.overall_score=parsed.final_score;
+  }
   return parsed;
 }
 
@@ -1018,6 +1029,24 @@ async function getOrCreateMultiSelectField(appToken, tableId, accessToken) {
   return { fieldId: newField.field_id, fieldName: altName };
 }
 
+// 确保存在数字类型字段
+async function ensureNumberField(appToken, tableId, accessToken, fieldName) {
+  const fields = await getFieldMeta(appToken, tableId, accessToken);
+  const exists = fields.find((f) => f.field_name === fieldName);
+  if (exists) return;
+  const resp = await fetch(`https://open.feishu.cn/open-apis/bitable/v1/apps/${appToken}/tables/${tableId}/fields`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ field_name: fieldName, type: 2 }), // 2: 数字
+  });
+  const text = await resp.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) {
+    throw new Error(`Create number field '${fieldName}' failed: ${resp.status} ${resp.statusText} ${text?.slice(0,200)}`);
+  }
+  if (data.code !== 0) throw new Error(`Create number field '${fieldName}' failed: ${data.msg}`);
+}
+
 async function ensureMultiSelectOptions(appToken, tableId, fieldId, tagNames, accessToken) {
   // 拉取当前 options（容错：若返回非 JSON，则退化为用列表接口获取字段属性）
   let current = [];
@@ -1186,7 +1215,18 @@ function formatOverallScriptEvaluation(result) {
   lines.push('## 整体脚本评估');
 
   // 顶部得分与理由
-  const score = result?.final_score ?? result?.overall_score;
+  // 展示原始分（未扣分、未限顶）
+  const deriveFused = () => {
+    const fs = result?.functional_score;
+    const ps = result?.perception_score;
+    if (typeof fs === 'number' && typeof ps === 'number') return Math.round(fs * 0.5 + ps * 0.5);
+    if (typeof fs === 'number') return fs;
+    if (typeof ps === 'number') return ps;
+    return null;
+  };
+  const score = (typeof result?.fused_pre_penalty === 'number')
+    ? result.fused_pre_penalty
+    : (deriveFused() ?? (result?.overall_score ?? result?.final_score));
   const rationale = result?.score_rationale;
   if (typeof score === 'number') {
     lines.push(`- **综合得分**: ${score}/100`);
@@ -1211,6 +1251,31 @@ function formatOverallScriptEvaluation(result) {
     if (typeof fusedPre === 'number') {
       const after = Math.max(0, Math.min(100, (fusedPre + (typeof pen === 'number' ? pen : 0))));
       lines.push(`- 融合后分: ${Math.min(after, typeof cap === 'number' ? cap : 100)}/100`);
+    }
+  }
+
+  // 新增：质量评级与优质度
+  const qi = typeof result?.quality_index === 'number' ? result.quality_index : null;
+  const qr = result?.quality_rating;
+  const oc = (typeof result?.on_camera_speech === 'boolean') ? result.on_camera_speech : (typeof result?.on_camera_speech_final === 'boolean' ? result.on_camera_speech_final : null);
+  const ocBasis = result?.on_camera_speech_basis || result?.quality_components?.on_camera_speech_basis || '';
+  const missSummary = Array.isArray(result?.quality_components?.missing_summary) ? result.quality_components.missing_summary : [];
+  if (qi !== null || qr || oc !== null) {
+    lines.push('', '### 质量评级与优质度');
+    if (qr) lines.push(`- 质量评级: ${qr}`);
+    if (qi !== null) lines.push(`- 优质度指数: ${qi}/100`);
+    if (oc !== null) lines.push(`- 真人口播: ${oc ? '是' : '否'}${ocBasis ? `（依据：${ocBasis}）` : ''}`);
+    const missParts = missSummary.filter(Boolean).slice(0, 3);
+    if (missParts.length) lines.push(`- 关键缺失: ${missParts.join('、')}`);
+    const cmp = result?.quality_components;
+    if (cmp) {
+      const ks = [];
+      if (typeof cmp.critical_omission_penalty === 'number') ks.push(`缺失项扣分: ${cmp.critical_omission_penalty}`);
+      if (typeof cmp.anti_pattern_penalty === 'number') ks.push(`反模式扣分: ${cmp.anti_pattern_penalty}`);
+      if (typeof cmp.highlight_bonus === 'number') ks.push(`亮点加分: ${cmp.highlight_bonus}`);
+      if (typeof cmp.unfair_penalty === 'number') ks.push(`不公平对比扣分(单列): ${cmp.unfair_penalty}`);
+      if (typeof cmp.medical_penalty === 'number') ks.push(`医疗化/夸大承诺扣分(单列): ${cmp.medical_penalty}`);
+      if (ks.length) lines.push(`- 加扣明细: ${ks.join('；')}`);
     }
   }
 
@@ -1398,6 +1463,229 @@ function formatOverallScriptEvaluation(result) {
   return lines.join('\n');
 }
 
+// ===== 质量信号与评分（优质度指数/评级） =====
+function timeStrToSeconds(s) {
+  if (!s || typeof s !== 'string') return null;
+  const parts = s.trim().split(':').map((v) => Number(v));
+  if (parts.some((v) => Number.isNaN(v))) return null;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return null;
+}
+
+function getArraySafe(v) { return Array.isArray(v) ? v : []; }
+function getLabels(node) {
+  if (!node || typeof node !== 'object') return [];
+  const arr = Array.isArray(node.labels) ? node.labels : [];
+  return arr.filter((x) => typeof x === 'string');
+}
+
+function includesAny(text, kws) {
+  const t = String(text || '').toLowerCase();
+  return kws.some((k) => t.includes(k));
+}
+
+function detectStructurePresence(result) {
+  const segs = getArraySafe(result?.video_structure?.segments);
+  const names = segs.map((s) => String(s?.partName || '')).filter(Boolean);
+  const hasByName = (kws) => names.some((n) => includesAny(n, kws));
+  const pe = result?.panel_evaluation || {};
+  const closeCl = pe?.close?.checklist || {};
+  const pitchCl = pe?.pitch?.checklist || {};
+  const hookCl = pe?.hook?.checklist || {};
+
+  const hook = hasByName(['hook', '钩', '开场']) || Object.values(hookCl).some((v) => v === true);
+  const painOrScene = hasByName(['痛点', '问题', '场景', 'problem', 'pain', 'scene']) || (hookCl['灵魂发问'] === true || hookCl['反差剧情'] === true);
+  const showcase = hasByName(['展示', '演示', '方案', '种草', 'product', 'showcase', 'demo']) || (pitchCl['手法专业流畅'] === true || pitchCl['过程观感舒适'] === true);
+  const proof = hasByName(['证明', '背书', '对比', '案例', 'proof', 'compare', 'before', 'after']) || (pitchCl['对比真实性高'] === true);
+  const cta = hasByName(['cta', '行动', '号召', '购买', '下单', 'link', '关注', 'call to action']) || (closeCl['视觉CTA明显'] === true || closeCl['口播CTA清晰'] === true || closeCl['字幕CTA明确'] === true);
+
+  return { hook, painOrScene, showcase, proof, cta };
+}
+
+function computeQualitySignals(result) {
+  const pe = result?.panel_evaluation || {};
+  const closeCl = pe?.close?.checklist || {};
+  const pitchCl = pe?.pitch?.checklist || {};
+  const hookScore = typeof pe?.hook?.score === 'number' ? pe.hook.score : null;
+  const closeScore = typeof pe?.close?.score === 'number' ? pe.close.score : null;
+
+  const visualAudio = result?.v3_labeling?.visual_audio || {};
+  const appearance = getLabels(visualAudio.appearance_scene);
+  const audioSpeech = getLabels(visualAudio.audio_speech);
+  const rhythm = getLabels(visualAudio.rhythm_bgm);
+  const emotion = getLabels(visualAudio.emotion_style);
+
+  const contentScript = result?.v3_labeling?.content_script || {};
+  const narrative = getLabels(contentScript.narrative_framework);
+  const demoMethods = getLabels(result?.v3_labeling?.product_showcase?.demonstration_methods);
+
+  const onCameraProvided = typeof result?.on_camera_speech === 'boolean' ? result.on_camera_speech : null;
+  const isPersonOnCam = appearance.includes('真人出镜');
+  const hasVoiceOver = audioSpeech.some((l) => l.includes('人声口播') || l.toLowerCase().includes('voice'));
+  const hasSync = audioSpeech.some((l) => l.includes('现场收音') || l.includes('同期声'));
+  const onCameraDerived = isPersonOnCam && hasSync && !hasVoiceOver;
+  const onCameraFinal = onCameraProvided !== null ? onCameraProvided : onCameraDerived;
+
+  const emotionNatural = pitchCl['表达自然有人味'] === true;
+  const emotionNotNatural = pitchCl['表达自然有人味'] === false;
+  const emotionHigh = emotion.some((l) => l.includes('视频情绪:情绪高昂'));
+
+  const qualityPass = pitchCl['光线与画质达标'] === true;
+  const qualityFail = pitchCl['光线与画质达标'] === false;
+
+  const groups = getArraySafe(result?.subtitle_groups);
+  let strongCount = 0; let durationTotal = 0; let durationCount = 0;
+  for (const g of groups) {
+    if (g?.isVisuallyStrong) strongCount++;
+    const a = timeStrToSeconds(g?.startTime);
+    const b = timeStrToSeconds(g?.endTime);
+    if (a !== null && b !== null && b > a) { durationTotal += (b - a); durationCount++; }
+  }
+  const strongRatio = groups.length > 0 ? (strongCount / groups.length) : 0;
+  const avgSegDur = durationCount > 0 ? (durationTotal / durationCount) : null;
+
+  const structure = detectStructurePresence(result);
+  const ctaHits = [closeCl['视觉CTA明显'] === true, closeCl['口播CTA清晰'] === true, closeCl['字幕CTA明确'] === true].filter(Boolean).length;
+
+  const rfArr = Array.isArray(result?.red_flags) ? result.red_flags : [];
+  const getRF = (name) => rfArr.find((x) => x && x.name === name && x.hit === true) || null;
+  const unfair = getRF('不公平对比');
+  const medical = getRF('医疗化或夸大承诺');
+  const adlike = getRF('纯广告感强或噪声大或SKU混乱');
+  const noLive = getRF('全程无实拍或素材堆叠');
+
+  return {
+    structure,
+    hookScore, closeScore,
+    isPersonOnCam, hasVoiceOver, hasSync, onCameraFinal,
+    emotionNatural, emotionNotNatural, emotionHigh,
+    qualityPass, qualityFail,
+    strongCount, strongRatio, avgSegDur,
+    demoMethods, narrative, rhythm,
+    ctaHits,
+    rf: { unfair, medical, adlike, noLive },
+  };
+}
+
+function penaltyFromSeverity(node, map) {
+  if (!node) return 0;
+  const sev = String(node.severity || '').toLowerCase();
+  if (sev.includes('high')) return map.high;
+  if (sev.includes('mid')) return map.mid;
+  if (sev.includes('low')) return map.low;
+  return 0;
+}
+
+function computeQualityIndexAndRating(result) {
+  const signals = computeQualitySignals(result);
+  const base = (typeof result?.fused_pre_penalty === 'number')
+    ? result.fused_pre_penalty
+    : (() => {
+        const fs = typeof result?.functional_score === 'number' ? result.functional_score : null;
+        const ps = typeof result?.perception_score === 'number' ? result.perception_score : null;
+        if (fs !== null && ps !== null) return Math.round(fs * 0.5 + ps * 0.5);
+        if (fs !== null) return fs;
+        if (ps !== null) return ps;
+        return 0;
+      })();
+
+  // 缺失项扣分
+  let criticalPenalty = 0;
+  const miss = [];
+  if (!signals.structure.hook) { criticalPenalty += 25; miss.push('缺Hook'); }
+  if (!signals.structure.cta) { criticalPenalty += 25; miss.push('缺CTA'); }
+  if (!signals.structure.painOrScene) { criticalPenalty += 10; miss.push('缺痛点/场景'); }
+  if (!signals.structure.showcase) { criticalPenalty += 10; miss.push('缺展示/方案'); }
+  if (!signals.structure.proof) { criticalPenalty += 10; miss.push('缺证据/对比'); }
+  if (typeof signals.hookScore === 'number' && signals.hookScore < 40) criticalPenalty += 5;
+  if (typeof signals.closeScore === 'number' && signals.closeScore < 40) criticalPenalty += 5;
+
+  // 反模式扣分（排除：不公平对比/医疗化，改为单列标注）
+  let antiPatternPenalty = 0;
+  antiPatternPenalty += penaltyFromSeverity(signals.rf.adlike, { low: 5, mid: 10, high: 15 });
+  antiPatternPenalty += penaltyFromSeverity(signals.rf.noLive, { low: 10, mid: 15, high: 20 });
+
+  const unfairPenalty = -penaltyFromSeverity(signals.rf.unfair, { low: 10, mid: 15, high: 20 });
+  const medicalPenalty = -penaltyFromSeverity(signals.rf.medical, { low: 15, mid: 20, high: 30 });
+
+  // 正向加分与其它扣分
+  let positive = 0;
+  // 结构覆盖正向：痛点/展示/证据/CTA 各 +2；黄金3秒无致命缺陷 +2（简化为无“严重/致命/失败”等词）
+  if (signals.structure.painOrScene) positive += 2;
+  if (signals.structure.showcase) positive += 2;
+  if (signals.structure.proof) positive += 2;
+  if (signals.structure.cta) positive += 2;
+  const g3 = String(result?.video_structure?.golden_3s_hook_analysis || '').toLowerCase();
+  const badG3 = ['致命', '严重', '失败', '完全没有', '极差'].some((k) => g3.includes(k));
+  if (!badG3 && g3) positive += 2;
+
+  // 真人口播（当镜口述）正负
+  if (signals.isPersonOnCam) positive += 3; // 真人出镜
+  if (signals.hasSync) positive += 2; // 同期声
+  if (signals.isPersonOnCam && signals.hasSync && !signals.hasVoiceOver) positive += 2; // 两者兼有
+  if (signals.isPersonOnCam && signals.hasVoiceOver) criticalPenalty += 5; // 误导：真人出镜却画外音
+  if (!signals.isPersonOnCam && !signals.hasSync) criticalPenalty += 10; // 无真人且无当镜口述
+
+  // 情绪（仅当镜口述前提）
+  if (signals.onCameraFinal) {
+    if (signals.emotionNatural) positive += 5;
+    if (signals.emotionNotNatural) criticalPenalty += 10;
+    if (signals.emotionHigh) positive += 3;
+  }
+
+  // 画质
+  if (signals.qualityPass) positive += 5;
+  if (signals.qualityFail) criticalPenalty += 15;
+  if (signals.demoMethods.includes('高清质地特写')) positive += 3;
+  if (signals.strongRatio >= 0.15) positive += 2;
+  if (signals.strongRatio > 0 && signals.strongRatio < 0.05) criticalPenalty += 5;
+
+  // 节奏
+  const tight = signals.rhythm.some((l) => l.includes('节奏紧凑') || l.includes('强卡点'));
+  if (tight) positive += 5;
+  if (typeof signals.avgSegDur === 'number' && signals.avgSegDur >= 2 && signals.avgSegDur <= 6) positive += 3;
+  if (!tight && typeof signals.avgSegDur === 'number' && signals.avgSegDur > 6) criticalPenalty += (signals.avgSegDur > 10 ? 10 : 5);
+
+  // CTA 完备
+  if (signals.ctaHits === 3) positive += 5;
+
+  // 亮点加分（封顶 +10）：高光≥3；高清特写+对比测试；CTA三项全命中
+  let highlight = 0; const HIGHLIGHT_CAP = 10;
+  if (signals.strongCount >= 3) highlight += 5;
+  if (signals.demoMethods.includes('高清质地特写') && signals.narrative.includes('对比测试')) highlight += 5;
+  if (signals.ctaHits === 3) highlight += 5;
+  if (highlight > HIGHLIGHT_CAP) highlight = HIGHLIGHT_CAP;
+
+  const qualityIndexRaw = base + positive + highlight - criticalPenalty - antiPatternPenalty;
+  const qualityIndex = Math.max(0, Math.min(100, Math.round(qualityIndexRaw)));
+
+  // 评级（默认二档）
+  let rating = '普通';
+  const passStructure = signals.structure.hook && signals.structure.cta;
+  if (qualityIndex >= 80 && passStructure && criticalPenalty <= 10) rating = '优秀';
+
+  const components = {
+    base,
+    positive_bonus: positive,
+    highlight_bonus: highlight,
+    critical_omission_penalty: criticalPenalty,
+    anti_pattern_penalty: antiPatternPenalty,
+    unfair_penalty: unfairPenalty, // 单列，不计入quality_index
+    medical_penalty: medicalPenalty, // 单列，不计入quality_index
+    missing_summary: miss,
+    on_camera_speech_basis: result?.on_camera_speech_basis || (signals.onCameraFinal ? '真人出镜+同期声，且非画外音' : (signals.hasVoiceOver ? '检测到画外音' : '未满足当镜口述条件')),
+  };
+
+  return {
+    quality_index: qualityIndex,
+    quality_rating: rating,
+    on_camera_speech_final: signals.onCameraFinal,
+    quality_components: components,
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
   try {
@@ -1499,18 +1787,48 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- Step 2: Update the record ---
+    // --- Step 2: Compute quality and update the record ---
+    // 计算优质度指数与评级（不影响综合得分展示）
+    const quality = computeQualityIndexAndRating(result);
+    result.quality_index = quality.quality_index;
+    result.quality_rating = quality.quality_rating;
+    if (typeof result.on_camera_speech !== 'boolean') result.on_camera_speech = quality.on_camera_speech_final;
+    result.quality_components = quality.quality_components;
+
     const subtitlesAndAnalysisText = formatSubtitlesAndAnalysis(result);
     const structureAndAnalysisText = formatVideoStructureAndAnalysis(result);
     const overallEvaluationText = formatOverallScriptEvaluation(result);
+    // 扣分：原始分(融合前) - 最终分（含扣分与上限）
+    const deriveFusedForUpdate = () => {
+      const fs = typeof result?.functional_score === 'number' ? result.functional_score : null;
+      const ps = typeof result?.perception_score === 'number' ? result.perception_score : null;
+      if (fs !== null && ps !== null) return Math.round(fs * 0.5 + ps * 0.5);
+      if (fs !== null) return fs;
+      if (ps !== null) return ps;
+      return null;
+    };
+    const originalScore = (typeof result?.fused_pre_penalty === 'number') ? result.fused_pre_penalty : deriveFusedForUpdate();
+    const finalScore = (typeof result?.final_score === 'number') ? result.final_score : (typeof result?.overall_score === 'number' ? result.overall_score : null);
+    const deduction = (typeof originalScore === 'number' && typeof finalScore === 'number') ? Math.max(0, originalScore - finalScore) : null;
 
-    // 确保目标文本字段存在
+    // 确保目标字段存在
     if (accessToken && !disableFeishu) {
       await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '字幕与分析');
       await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '视频结构与分析');
       await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '整体脚本评估');
       // 可选：确保状态字段存在
       await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '是否发起分析');
+      // 确保“扣分”为数字列（若不存在则创建）
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '扣分');
+      // 质量相关字段
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '优质度指数');
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '缺失项扣分');
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '反模式扣分');
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '亮点加分');
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '不公平对比扣分');
+      await ensureNumberField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '医疗化或夸大承诺扣分');
+      await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '质量评级');
+      await ensureTextField(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, accessToken, '真人口播判定');
     }
 
     const fieldsToUpdate = {
@@ -1519,6 +1837,18 @@ export default async function handler(req, res) {
       '整体脚本评估': overallEvaluationText,
       '是否发起分析': '已分析',
     };
+    if (typeof deduction === 'number') {
+      fieldsToUpdate['扣分'] = deduction;
+    }
+    // 写入质量相关字段
+    if (typeof result?.quality_index === 'number') fieldsToUpdate['优质度指数'] = result.quality_index;
+    if (typeof result?.quality_components?.critical_omission_penalty === 'number') fieldsToUpdate['缺失项扣分'] = result.quality_components.critical_omission_penalty;
+    if (typeof result?.quality_components?.anti_pattern_penalty === 'number') fieldsToUpdate['反模式扣分'] = result.quality_components.anti_pattern_penalty;
+    if (typeof result?.quality_components?.highlight_bonus === 'number') fieldsToUpdate['亮点加分'] = result.quality_components.highlight_bonus;
+    if (typeof result?.quality_components?.unfair_penalty === 'number') fieldsToUpdate['不公平对比扣分'] = result.quality_components.unfair_penalty;
+    if (typeof result?.quality_components?.medical_penalty === 'number') fieldsToUpdate['医疗化或夸大承诺扣分'] = result.quality_components.medical_penalty;
+    if (result?.quality_rating) fieldsToUpdate['质量评级'] = result.quality_rating;
+    if (typeof result?.on_camera_speech === 'boolean') fieldsToUpdate['真人口播判定'] = result.on_camera_speech ? '是' : '否';
 
         if (accessToken && !disableFeishu) {
           await updateRecord(env.FEISHU_APP_TOKEN, env.FEISHU_TABLE_ID, feishuRecordId, fieldsToUpdate, accessToken);

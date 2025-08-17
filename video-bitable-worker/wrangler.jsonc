@@ -5,7 +5,7 @@
   "vars": {
     "FEISHU_APP_TOKEN": "T68zbfXIlaHT0TsOuvNc8iEZnib",
     "FEISHU_TABLE_ID": "tblQXAFdK6F1YlBf",
-    "VERCEL_CONSUMER_URL": "https://video-analyzer-consumer-q3787vm3m-jianghpffs-projects.vercel.app/api/queue-consumer",
+    "VERCEL_CONSUMER_URL": "https://video-analyzer-consumer-n5ye9cek6-jianghpffs-projects.vercel.app/api/queue-consumer",
     "RATE_LIMIT_QPS": "5",
     "VERCEL_PROTECTION_BYPASS": ""
   },
