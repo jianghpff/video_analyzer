@@ -5,21 +5,16 @@
   "vars": {
     "FEISHU_APP_TOKEN": "T68zbfXIlaHT0TsOuvNc8iEZnib",
     "FEISHU_TABLE_ID": "tblQXAFdK6F1YlBf",
-    "VERCEL_CONSUMER_URL": "https://video-analyzer-consumer-doxoklrp3-jianghpffs-projects.vercel.app/api/queue-consumer",
+    "VERCEL_CONSUMER_URL": "https://video-analyzer-consumer-gc7vffhxk-jianghpffs-projects.vercel.app/api/queue-consumer",
     "RATE_LIMIT_QPS": "5",
     "VERCEL_PROTECTION_BYPASS": ""
   },
   "queues": {
     "producers": [
-      {
-        "binding": "VIDEO_ANALYSIS_QUEUE",
-        "queue": "video-analysis-queues"
-      }
+      { "binding": "VIDEO_ANALYSIS_QUEUE", "queue": "video-analysis-queues" }
     ],
     "consumers": [
-      {
-        "queue": "video-analysis-queues"
-      }
+      { "queue": "video-analysis-queues" }
     ]
   },
   "services": [
@@ -41,15 +36,10 @@
       },
       "queues": {
         "producers": [
-          {
-            "binding": "VIDEO_ANALYSIS_QUEUE",
-            "queue": "video-analysis-queues-2"
-          }
+          { "binding": "VIDEO_ANALYSIS_QUEUE", "queue": "video-analysis-queues-2" }
         ],
         "consumers": [
-          {
-            "queue": "video-analysis-queues-2"
-          }
+          { "queue": "video-analysis-queues-2" }
         ]
       },
       "services": [

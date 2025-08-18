@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "dev:prod2": "wrangler dev -e prod2",
+    "deploy:prod2": "wrangler deploy -e prod2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240725.0",

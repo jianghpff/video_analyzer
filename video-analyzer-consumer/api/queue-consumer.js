@@ -13,10 +13,19 @@ async function fetchVideoBufferById(videoId) {
     timeout: 30000,
   });
   if (!resp.ok) throw new Error(`Worker fetch failed: ${resp.status}`);
-  const arr = await resp.json();
+  let arr;
+  try {
+    arr = await resp.json();
+  } catch (e) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`Downloader returned non-JSON: ${text?.slice(0,200)}`);
+  }
   const item = Array.isArray(arr) ? arr.find(x => String(x.videoId) === String(videoId)) : null;
-  if (!item || !item.downloadUrl) throw new Error('No downloadUrl for this videoId');
-  const mp4 = await fetch(item.downloadUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 30000 });
+  if (!item) throw new Error('Downloader returned no item for this videoId');
+  if (item && item.error) throw new Error(`Downloader error: ${item.error}`);
+  const url = item.downloadUrl || item.url || item.download_url || item.nowm || item.play || item.playAddr;
+  if (!url) throw new Error('No downloadUrl (or compatible field) from downloader');
+  const mp4 = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 30000 });
   if (!mp4.ok) throw new Error(`Download mp4 failed: ${mp4.status}`);
   return Buffer.from(await mp4.arrayBuffer());
 }
@@ -1245,13 +1254,8 @@ function formatOverallScriptEvaluation(result) {
     const fusedPre = result?.fused_pre_penalty;
     const pen = result?.penalty_total;
     const cap = result?.cap_applied;
-    if (typeof fusedPre === 'number') lines.push(`- 融合前分: ${fusedPre}/100`);
+    // 精简展示：不展示 融合前分/分数上限/融合后分，仅保留必要信息
     if (typeof pen === 'number' && pen !== 0) lines.push(`- 红旗扣分: ${pen}`);
-    if (typeof cap === 'number' && cap < 100) lines.push(`- 分数上限: ${cap}`);
-    if (typeof fusedPre === 'number') {
-      const after = Math.max(0, Math.min(100, (fusedPre + (typeof pen === 'number' ? pen : 0))));
-      lines.push(`- 融合后分: ${Math.min(after, typeof cap === 'number' ? cap : 100)}/100`);
-    }
   }
 
   // 新增：质量评级与优质度
@@ -1264,18 +1268,38 @@ function formatOverallScriptEvaluation(result) {
     lines.push('', '### 质量评级与优质度');
     if (qr) lines.push(`- 质量评级: ${qr}`);
     if (qi !== null) lines.push(`- 优质度指数: ${qi}/100`);
+    // 明确基础分来源以避免误解（默认为综合原始分 fused_pre_penalty）
+    const baseForQuality = (typeof result?.fused_pre_penalty === 'number') ? result.fused_pre_penalty : deriveFused();
+    if (typeof baseForQuality === 'number') lines.push(`- 基础分: ${baseForQuality}/100`);
     if (oc !== null) lines.push(`- 真人口播: ${oc ? '是' : '否'}${ocBasis ? `（依据：${ocBasis}）` : ''}`);
     const missParts = missSummary.filter(Boolean).slice(0, 3);
     if (missParts.length) lines.push(`- 关键缺失: ${missParts.join('、')}`);
     const cmp = result?.quality_components;
     if (cmp) {
-      const ks = [];
-      if (typeof cmp.critical_omission_penalty === 'number') ks.push(`缺失项扣分: ${cmp.critical_omission_penalty}`);
-      if (typeof cmp.anti_pattern_penalty === 'number') ks.push(`反模式扣分: ${cmp.anti_pattern_penalty}`);
-      if (typeof cmp.highlight_bonus === 'number') ks.push(`亮点加分: ${cmp.highlight_bonus}`);
-      if (typeof cmp.unfair_penalty === 'number') ks.push(`不公平对比扣分(单列): ${cmp.unfair_penalty}`);
-      if (typeof cmp.medical_penalty === 'number') ks.push(`医疗化/夸大承诺扣分(单列): ${cmp.medical_penalty}`);
-      if (ks.length) lines.push(`- 加扣明细: ${ks.join('；')}`);
+      // 加分与扣分分别列出具体项
+      const pos = Array.isArray(cmp.positive_reasons) ? cmp.positive_reasons : [];
+      const hl = Array.isArray(cmp.highlight_reasons) ? cmp.highlight_reasons : [];
+      const negCritical = Array.isArray(cmp.critical_reasons) ? cmp.critical_reasons : [];
+      const negAnti = Array.isArray(cmp.anti_reasons) ? cmp.anti_reasons : [];
+      const unfairSingle = typeof cmp.unfair_penalty === 'number' && cmp.unfair_penalty !== 0 ? `不公平对比（${cmp.unfair_penalty}）` : '';
+      const medicalSingle = typeof cmp.medical_penalty === 'number' && cmp.medical_penalty !== 0 ? `医疗化/夸大承诺（${cmp.medical_penalty}）` : '';
+
+      const addItems = [...pos, ...hl];
+      const subItems = [...negCritical, ...negAnti];
+
+      if (addItems.length) {
+        lines.push('- 加分项:');
+        addItems.forEach((t) => lines.push(`  - ${t}`));
+      }
+      if (subItems.length || unfairSingle || medicalSingle) {
+        lines.push('- 减分项:');
+        subItems.forEach((t) => lines.push(`  - ${t}`));
+        if (unfairSingle || medicalSingle) {
+          lines.push('  - 单列标注:');
+          if (unfairSingle) lines.push(`    - ${unfairSingle}`);
+          if (medicalSingle) lines.push(`    - ${medicalSingle}`);
+        }
+      }
     }
   }
 
@@ -1591,21 +1615,29 @@ function computeQualityIndexAndRating(result) {
         return 0;
       })();
 
+  // 准备明细容器
+  const positiveReasons = [];
+  const highlightReasons = [];
+  const criticalReasons = [];
+  const antiReasons = [];
+
   // 缺失项扣分
   let criticalPenalty = 0;
   const miss = [];
-  if (!signals.structure.hook) { criticalPenalty += 25; miss.push('缺Hook'); }
-  if (!signals.structure.cta) { criticalPenalty += 25; miss.push('缺CTA'); }
-  if (!signals.structure.painOrScene) { criticalPenalty += 10; miss.push('缺痛点/场景'); }
-  if (!signals.structure.showcase) { criticalPenalty += 10; miss.push('缺展示/方案'); }
-  if (!signals.structure.proof) { criticalPenalty += 10; miss.push('缺证据/对比'); }
-  if (typeof signals.hookScore === 'number' && signals.hookScore < 40) criticalPenalty += 5;
-  if (typeof signals.closeScore === 'number' && signals.closeScore < 40) criticalPenalty += 5;
+  if (!signals.structure.hook) { criticalPenalty += 25; miss.push('缺Hook'); criticalReasons.push('缺Hook -25'); }
+  if (!signals.structure.cta) { criticalPenalty += 25; miss.push('缺CTA'); criticalReasons.push('缺CTA -25'); }
+  if (!signals.structure.painOrScene) { criticalPenalty += 10; miss.push('缺痛点/场景'); criticalReasons.push('缺痛点/场景 -10'); }
+  if (!signals.structure.showcase) { criticalPenalty += 10; miss.push('缺展示/方案'); criticalReasons.push('缺展示/方案 -10'); }
+  if (!signals.structure.proof) { criticalPenalty += 10; miss.push('缺证据/对比'); criticalReasons.push('缺证据/对比 -10'); }
+  if (typeof signals.hookScore === 'number' && signals.hookScore < 40) { criticalPenalty += 5; criticalReasons.push('Hook质量低(<40) -5'); }
+  if (typeof signals.closeScore === 'number' && signals.closeScore < 40) { criticalPenalty += 5; criticalReasons.push('Close质量低(<40) -5'); }
 
   // 反模式扣分（排除：不公平对比/医疗化，改为单列标注）
   let antiPatternPenalty = 0;
-  antiPatternPenalty += penaltyFromSeverity(signals.rf.adlike, { low: 5, mid: 10, high: 15 });
-  antiPatternPenalty += penaltyFromSeverity(signals.rf.noLive, { low: 10, mid: 15, high: 20 });
+  const adlikeP = penaltyFromSeverity(signals.rf.adlike, { low: 5, mid: 10, high: 15 });
+  if (adlikeP > 0) { antiPatternPenalty += adlikeP; antiReasons.push(`纯广告感强/噪声大或SKU混乱 -${adlikeP}`); }
+  const noLiveP = penaltyFromSeverity(signals.rf.noLive, { low: 10, mid: 15, high: 20 });
+  if (noLiveP > 0) { antiPatternPenalty += noLiveP; antiReasons.push(`全程无实拍或素材堆叠 -${noLiveP}`); }
 
   const unfairPenalty = -penaltyFromSeverity(signals.rf.unfair, { low: 10, mid: 15, high: 20 });
   const medicalPenalty = -penaltyFromSeverity(signals.rf.medical, { low: 15, mid: 20, high: 30 });
@@ -1613,49 +1645,49 @@ function computeQualityIndexAndRating(result) {
   // 正向加分与其它扣分
   let positive = 0;
   // 结构覆盖正向：痛点/展示/证据/CTA 各 +2；黄金3秒无致命缺陷 +2（简化为无“严重/致命/失败”等词）
-  if (signals.structure.painOrScene) positive += 2;
-  if (signals.structure.showcase) positive += 2;
-  if (signals.structure.proof) positive += 2;
-  if (signals.structure.cta) positive += 2;
+  if (signals.structure.painOrScene) { positive += 2; positiveReasons.push('结构覆盖-痛点/场景 +2'); }
+  if (signals.structure.showcase) { positive += 2; positiveReasons.push('结构覆盖-展示/方案 +2'); }
+  if (signals.structure.proof) { positive += 2; positiveReasons.push('结构覆盖-证据/对比 +2'); }
+  if (signals.structure.cta) { positive += 2; positiveReasons.push('结构覆盖-CTA +2'); }
   const g3 = String(result?.video_structure?.golden_3s_hook_analysis || '').toLowerCase();
   const badG3 = ['致命', '严重', '失败', '完全没有', '极差'].some((k) => g3.includes(k));
-  if (!badG3 && g3) positive += 2;
+  if (!badG3 && g3) { positive += 2; positiveReasons.push('黄金3秒无致命缺陷 +2'); }
 
   // 真人口播（当镜口述）正负
-  if (signals.isPersonOnCam) positive += 3; // 真人出镜
-  if (signals.hasSync) positive += 2; // 同期声
-  if (signals.isPersonOnCam && signals.hasSync && !signals.hasVoiceOver) positive += 2; // 两者兼有
-  if (signals.isPersonOnCam && signals.hasVoiceOver) criticalPenalty += 5; // 误导：真人出镜却画外音
-  if (!signals.isPersonOnCam && !signals.hasSync) criticalPenalty += 10; // 无真人且无当镜口述
+  if (signals.isPersonOnCam) { positive += 3; positiveReasons.push('真人出镜 +3'); }
+  if (signals.hasSync) { positive += 2; positiveReasons.push('同期声 +2'); }
+  if (signals.isPersonOnCam && signals.hasSync && !signals.hasVoiceOver) { positive += 2; positiveReasons.push('当镜口述 +2'); }
+  if (signals.isPersonOnCam && signals.hasVoiceOver) { criticalPenalty += 5; criticalReasons.push('真人出镜但画外音 -5'); }
+  if (!signals.isPersonOnCam && !signals.hasSync) { criticalPenalty += 10; criticalReasons.push('无真人且无当镜口述 -10'); }
 
   // 情绪（仅当镜口述前提）
   if (signals.onCameraFinal) {
-    if (signals.emotionNatural) positive += 5;
-    if (signals.emotionNotNatural) criticalPenalty += 10;
-    if (signals.emotionHigh) positive += 3;
+    if (signals.emotionNatural) { positive += 5; positiveReasons.push('表达自然有人味 +5'); }
+    if (signals.emotionNotNatural) { criticalPenalty += 10; criticalReasons.push('表达不自然 -10'); }
+    if (signals.emotionHigh) { positive += 3; positiveReasons.push('情绪高昂 +3'); }
   }
 
   // 画质
-  if (signals.qualityPass) positive += 5;
-  if (signals.qualityFail) criticalPenalty += 15;
-  if (signals.demoMethods.includes('高清质地特写')) positive += 3;
-  if (signals.strongRatio >= 0.15) positive += 2;
-  if (signals.strongRatio > 0 && signals.strongRatio < 0.05) criticalPenalty += 5;
+  if (signals.qualityPass) { positive += 5; positiveReasons.push('画质达标 +5'); }
+  if (signals.qualityFail) { criticalPenalty += 15; criticalReasons.push('画质不达标 -15'); }
+  if (signals.demoMethods.includes('高清质地特写')) { positive += 3; positiveReasons.push('高清质地特写 +3'); }
+  if (signals.strongRatio >= 0.15) { positive += 2; positiveReasons.push('强视觉片段占比≥15% +2'); }
+  if (signals.strongRatio > 0 && signals.strongRatio < 0.05) { criticalPenalty += 5; criticalReasons.push('强视觉片段占比<5% -5'); }
 
   // 节奏
   const tight = signals.rhythm.some((l) => l.includes('节奏紧凑') || l.includes('强卡点'));
-  if (tight) positive += 5;
-  if (typeof signals.avgSegDur === 'number' && signals.avgSegDur >= 2 && signals.avgSegDur <= 6) positive += 3;
-  if (!tight && typeof signals.avgSegDur === 'number' && signals.avgSegDur > 6) criticalPenalty += (signals.avgSegDur > 10 ? 10 : 5);
+  if (tight) { positive += 5; positiveReasons.push('节奏紧凑/强卡点 +5'); }
+  if (typeof signals.avgSegDur === 'number' && signals.avgSegDur >= 2 && signals.avgSegDur <= 6) { positive += 3; positiveReasons.push('平均片段2-6秒 +3'); }
+  if (!tight && typeof signals.avgSegDur === 'number' && signals.avgSegDur > 6) { const p = (signals.avgSegDur > 10 ? 10 : 5); criticalPenalty += p; criticalReasons.push(`节奏偏慢(平均片段>${signals.avgSegDur>10? '10':'6'}s) -${p}`); }
 
   // CTA 完备
-  if (signals.ctaHits === 3) positive += 5;
+  if (signals.ctaHits === 3) { positive += 5; positiveReasons.push('CTA三项全命中 +5'); }
 
   // 亮点加分（封顶 +10）：高光≥3；高清特写+对比测试；CTA三项全命中
   let highlight = 0; const HIGHLIGHT_CAP = 10;
-  if (signals.strongCount >= 3) highlight += 5;
-  if (signals.demoMethods.includes('高清质地特写') && signals.narrative.includes('对比测试')) highlight += 5;
-  if (signals.ctaHits === 3) highlight += 5;
+  if (signals.strongCount >= 3) { highlight += 5; highlightReasons.push('高光片段≥3 +5'); }
+  if (signals.demoMethods.includes('高清质地特写') && signals.narrative.includes('对比测试')) { highlight += 5; highlightReasons.push('高清特写+对比测试 +5'); }
+  if (signals.ctaHits === 3) { highlight += 5; highlightReasons.push('CTA三项全命中 +5'); }
   if (highlight > HIGHLIGHT_CAP) highlight = HIGHLIGHT_CAP;
 
   const qualityIndexRaw = base + positive + highlight - criticalPenalty - antiPatternPenalty;
@@ -1676,6 +1708,10 @@ function computeQualityIndexAndRating(result) {
     medical_penalty: medicalPenalty, // 单列，不计入quality_index
     missing_summary: miss,
     on_camera_speech_basis: result?.on_camera_speech_basis || (signals.onCameraFinal ? '真人出镜+同期声，且非画外音' : (signals.hasVoiceOver ? '检测到画外音' : '未满足当镜口述条件')),
+    positive_reasons: positiveReasons,
+    highlight_reasons: highlightReasons,
+    critical_reasons: criticalReasons,
+    anti_reasons: antiReasons,
   };
 
   return {
